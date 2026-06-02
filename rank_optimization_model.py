@@ -30,7 +30,7 @@ from rank_factor_tools import (
 
 
 DATA_PATH = Path(__file__).with_name("data.mat")
-CONSTRAINT_WEIGHT = 3.0e-4
+CONSTRAINT_WEIGHT = 10.0
 
 
 VariableDict = dict[str, np.ndarray | float]

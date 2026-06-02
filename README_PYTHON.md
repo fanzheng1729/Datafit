@@ -382,10 +382,9 @@ while vanilla and raw P/Q directions stay trapped at `O(1e-18)` steps.
 
 ### Constraint Weight Selection
 
-The current vanilla optimizer default is the conservative fixed value
-`constraint_weight = 3e-4` for divergence and curl.  Earlier experiments used
-`constraint_weight = 10`; to test removing that old factor, run the same
-saved-state comparison with
+The current vanilla optimizer default keeps the actual objective weight
+`constraint_weight = 10` for divergence and curl.  To test removing that factor,
+run the same saved-state comparison with
 `--constraint-weight 1`:
 
 ```powershell
@@ -482,8 +481,8 @@ conservative: weight = clip(10*rho, 1e-4, 1e-2)  -> 3.22e-4 here
 aggressive:   weight = clip(rho,    3e-5, 1e-2)  -> 3.22e-5 here
 ```
 
-The conservative proxy is the safer default.  A nearby fixed test at `3e-4`
-keeps all four unweighted components nonincreasing:
+The conservative proxy is the safer low-weight diagnostic choice.  A nearby
+fixed test at `3e-4` keeps all four unweighted components nonincreasing:
 
 ```text
 weight 3e-4:
@@ -504,35 +503,36 @@ weight 3e-5:
 
 But it is close to the failure regime.  At `1e-5`, `Fomega+Fzeta` improves more
 (`-4.73e-4`), but divergence and curl both get worse in unweighted units.  So
-use the conservative proxy unless there is an explicit component-increase guard
-that rejects steps when divergence or curl increase too much.
+use the conservative proxy for low-weight diagnostics unless there is an
+explicit component-increase guard that rejects steps when divergence or curl
+increase too much.
 
-### Committed Vanilla Default-Weight Result
+### Committed Vanilla Actual-Weight Result
 
-The repository includes one recorded vanilla run using the hard-coded default
-`constraint_weight = 3e-4`:
+The repository includes one recorded vanilla run using the hard-coded actual
+constraint weight `10` and the optimizer's variable line-search step scale:
 
 ```powershell
-python optimize_rank_factors.py --max-iterations 30 `
-  --output-prefix vanilla_cw0p0003_rank_optimization
+python optimize_rank_factors.py --max-iterations 50 `
+  --output-prefix vanilla_50_rank_optimization
 ```
 
 The files are:
 
-- `vanilla_cw0p0003_rank_optimization_results.json`
-- `vanilla_cw0p0003_rank_optimization_history.csv`
-- `vanilla_cw0p0003_rank_optimization_state.npz`
+- `vanilla_50_rank_optimization_results.json`
+- `vanilla_50_rank_optimization_history.csv`
+- `vanilla_50_rank_optimization_state.npz`
 
 This is the plain projected-gradient optimizer, not one of the row-band or
-L-BFGS experiments.  It accepted all 30 trial steps and reduced the weighted
-objective from `1.0003000000000002` to `1.0002986303572519`
-(`dJ = -1.3696427483e-6`).  The final residual RMS values were:
+L-BFGS experiments.  It accepted all 50 trial steps and reduced the weighted
+objective from `11.0` to `10.952104431373305`
+(`dJ = -4.7895568627e-2`).  The final residual RMS values were:
 
 ```text
-fomega     7.9603408325e-08
-fzeta      4.7097495742e-08
-divergence 1.2299368046e-09
-curl       7.6325487393e-06
+fomega     7.9603408896e-08
+fzeta      4.7097495770e-08
+divergence 1.2299367228e-09
+curl       7.6306025891e-06
 ```
 
 ## Streamfunction Velocity Diagnostic

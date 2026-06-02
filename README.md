@@ -230,9 +230,9 @@ The comparison summary is
 `compare_rank_optimization_curl_trust_vs_plain_extend10_summary.json`.
 
 For the clean vanilla optimizer, the hard-coded divergence/curl constraint
-weight is now `3e-4`. This is the conservative value selected from the P/Q
-gradient-balance proxy: it makes the `Fomega/Fzeta` decrease visible while the
-unweighted divergence and curl errors still decrease in the fixed tests.
+weight keeps the actual objective value `10`. The lower-weight tests were
+diagnostics for understanding the gradient balance, not the default pushed
+formulation.
 
 The damped-curl-loss diagnostic confirms the localization picture but is not
 the main recommendation: among powers `1/32, 1/16, 1/8, 1/4`, `p=1/16` gave
