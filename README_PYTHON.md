@@ -507,6 +507,34 @@ But it is close to the failure regime.  At `1e-5`, `Fomega+Fzeta` improves more
 use the conservative proxy unless there is an explicit component-increase guard
 that rejects steps when divergence or curl increase too much.
 
+### Committed Vanilla Default-Weight Result
+
+The repository includes one recorded vanilla run using the hard-coded default
+`constraint_weight = 3e-4`:
+
+```powershell
+python optimize_rank_factors.py --max-iterations 30 `
+  --output-prefix vanilla_cw0p0003_rank_optimization
+```
+
+The files are:
+
+- `vanilla_cw0p0003_rank_optimization_results.json`
+- `vanilla_cw0p0003_rank_optimization_history.csv`
+- `vanilla_cw0p0003_rank_optimization_state.npz`
+
+This is the plain projected-gradient optimizer, not one of the row-band or
+L-BFGS experiments.  It accepted all 30 trial steps and reduced the weighted
+objective from `1.0003000000000002` to `1.0002986303572519`
+(`dJ = -1.3696427483e-6`).  The final residual RMS values were:
+
+```text
+fomega     7.9603408325e-08
+fzeta      4.7097495742e-08
+divergence 1.2299368046e-09
+curl       7.6325487393e-06
+```
+
 ## Streamfunction Velocity Diagnostic
 
 The current optimizer still treats the fitted near-field velocity pieces
