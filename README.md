@@ -229,10 +229,12 @@ The fair same-start plain L-BFGS comparison is
 The comparison summary is
 `compare_rank_optimization_curl_trust_vs_plain_extend10_summary.json`.
 
-For the clean vanilla optimizer, the hard-coded divergence/curl constraint
-weight keeps the actual objective value `10`. The lower-weight tests were
-diagnostics for understanding the gradient balance, not the default pushed
-formulation.
+The committed optimizer recommendation is the row-band P/Q direction with the
+low constraint weight `3e-4`.  Starting from
+`compare_curl_trust_rank_optimization_state.npz`, the recorded 30-step run
+reduces the weighted objective from `1.000296931941260` to
+`1.000227625747525` while keeping all four unweighted components
+nonincreasing.
 
 The damped-curl-loss diagnostic confirms the localization picture but is not
 the main recommendation: among powers `1/32, 1/16, 1/8, 1/4`, `p=1/16` gave

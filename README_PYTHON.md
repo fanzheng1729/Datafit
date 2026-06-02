@@ -382,9 +382,10 @@ while vanilla and raw P/Q directions stay trapped at `O(1e-18)` steps.
 
 ### Constraint Weight Selection
 
-The current vanilla optimizer default keeps the actual objective weight
-`constraint_weight = 10` for divergence and curl.  To test removing that factor,
-run the same saved-state comparison with
+The committed row-band P/Q optimizer result uses the conservative low weight
+`constraint_weight = 3e-4` for divergence and curl.  Earlier actual-objective
+tests used `constraint_weight = 10`; to test removing that factor, run the same
+saved-state comparison with
 `--constraint-weight 1`:
 
 ```powershell
@@ -441,7 +442,9 @@ weight   d(Fomega+Fzeta)  dFomega       dFzeta        dDivergence   dCurl
 0.1      -1.46e-06        -2.06e-07     -1.25e-06     -1.677e-01    -2.525e-03
 0.01     -4.68e-06        -1.82e-06     -2.86e-06     -1.680e-01    -3.342e-03
 0.001    -8.93e-06        -4.38e-06     -4.55e-06     -1.673e-01    -2.942e-03
+0.0003   -1.69e-05        -9.25e-06     -7.69e-06     -1.713e-01    -3.227e-03
 0.0001   -4.07e-05        -2.40e-05     -1.67e-05     -1.735e-01    -3.249e-03
+0.00003  -1.39e-04        -8.46e-05     -5.44e-05     -9.445e-02    -3.163e-03
 0.00001  -4.73e-04        -2.90e-04     -1.83e-04     +9.342e-01    +1.470e-02
 0.000001 -3.67e-03        -2.27e-03     -1.40e-03     +8.324e+01    +1.486e+00
 0.0000001 -3.72e-03       -2.27e-03     -1.45e-03     +1.122e+02    +5.553e+00
@@ -507,32 +510,37 @@ use the conservative proxy for low-weight diagnostics unless there is an
 explicit component-increase guard that rejects steps when divergence or curl
 increase too much.
 
-### Committed Vanilla Actual-Weight Result
+### Committed Row-Band 3e-4 Result
 
-The repository includes one recorded vanilla run using the hard-coded actual
-constraint weight `10` and the optimizer's variable line-search step scale:
+The repository includes one recorded row-band P/Q run using
+`constraint_weight = 3e-4`:
 
 ```powershell
-python optimize_rank_factors.py --max-iterations 50 `
-  --output-prefix vanilla_50_rank_optimization
+python optimize_rank_factors_pq_rowband.py --mode rowband_pq -n 30 `
+  --constraint-weight 0.0003 `
+  --state compare_curl_trust_rank_optimization_state.npz `
+  --pq-diagnostic pq_support_step_scaling_diagnostic_results.json `
+  --no-extra-shrinks `
+  --output-prefix compare_rowband_pq_cw0p0003_30_from_curl_trust_rank_optimization
 ```
 
 The files are:
 
-- `vanilla_50_rank_optimization_results.json`
-- `vanilla_50_rank_optimization_history.csv`
-- `vanilla_50_rank_optimization_state.npz`
+- `compare_curl_trust_rank_optimization_state.npz`
+- `pq_support_step_scaling_diagnostic_results.json`
+- `compare_rowband_pq_cw0p0003_30_from_curl_trust_rank_optimization_results.json`
+- `compare_rowband_pq_cw0p0003_30_from_curl_trust_rank_optimization_history.csv`
+- `compare_rowband_pq_cw0p0003_30_from_curl_trust_rank_optimization_state.npz`
 
-This is the plain projected-gradient optimizer, not one of the row-band or
-L-BFGS experiments.  It accepted all 50 trial steps and reduced the weighted
-objective from `11.0` to `10.952104431373305`
-(`dJ = -4.7895568627e-2`).  The final residual RMS values were:
+This run accepted all 30 trial steps and reduced the weighted objective from
+`1.000296931941260` to `1.000227625747525`
+(`dJ = -6.9306193735e-5`).  The final residual RMS values were:
 
 ```text
-fomega     7.9603408896e-08
-fzeta      4.7097495770e-08
-divergence 1.2299367228e-09
-curl       7.6306025891e-06
+fomega     7.9602670358e-08
+fzeta      4.7097133502e-08
+divergence 9.9719026589e-10
+curl       7.5643611626e-06
 ```
 
 ## Streamfunction Velocity Diagnostic
