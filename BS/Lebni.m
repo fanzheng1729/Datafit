@@ -1,9 +1,15 @@
 function wBi = Lebni(Bi, Fun, xx)
     % compute the derivatives of  Bi * W using Leibniz rule.
     % Bi(k, : ) is the k-1 th derivative of Bi, Fun{k} is k-1 derivatives of W
+    %
+    % The interpolation matrices can include a coordinate weight W. For the
+    % current optimizer W is usually constant, but keeping this helper makes the
+    % spline assembly match the original verified MATLAB routines.
 
     m = size(Bi, 1);
 
+    % Xg caches W and its derivatives at the evaluation points so the nested
+    % loop below only combines arrays.
     Xg = zeros(m, length(xx));
     wBi = zeros(size(Bi));
 

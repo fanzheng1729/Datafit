@@ -2,6 +2,10 @@ function g = Cutoff_exp_modi(f, x, a, k)
     % f = 1 / (1 + exp( 1/ x + 1 / (x-a)) ),
     % near 0,  f(x) can be Nan due to exp(1/ x + 1/ (x-a)) = Inf! Handle the special case
     % k is the number of derivatives, k >= 0; modify it using equivalent formula
+    %
+    % This helper evaluates the smooth cutoff and its derivatives on [0, a].
+    % The left half is filled by symmetry from f(a-x), avoiding overflow in
+    % the exponential representation near x = 0.
 
     g = zeros(size(x));
 
@@ -9,6 +13,8 @@ function g = Cutoff_exp_modi(f, x, a, k)
         g = intval(g);
     end
 
+    % id uses the numerically safe side of f directly; id2 mirrors from the
+    % safe side with the derivative sign from the chain rule.
     id = find(x > a / 2 & x < a);
     id2 = find(x > 0 & x <= a / 2);
     g(x <= 0) = 0;

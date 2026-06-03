@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Analytic vs finite-difference check for explicit-S rank variables."""
+"""Analytic vs finite-difference check for explicit-S rank variables.
+
+This is a diagnostic script, not part of the optimizer loop.  It chooses a few
+representative high-gradient coordinates plus one random direction and compares
+the analytic gradient from ``RankOptimizationModel`` against central finite
+differences of the full objective.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +38,8 @@ def coordinate_checks(
     variables: VariableDict,
     gradient: VariableDict,
 ) -> list[dict[str, Any]]:
+    """Check one high-signal coordinate in each array block plus the scalars."""
+
     checks: list[dict[str, Any]] = []
     base_objective = model.objective(variables)
     for key in model.array_keys():
@@ -39,6 +47,8 @@ def coordinate_checks(
         assert isinstance(grad, np.ndarray)
         probe_grad = np.abs(grad).copy()
         if key.endswith("_Q") and probe_grad.ndim == 2 and probe_grad.shape[0] > 20:
+            # The first/last Q rows can be dominated by boundary artifacts.  The
+            # check still covers Q blocks, but avoids selecting only edge rows.
             probe_grad[:8, :] = 0.0
             probe_grad[-8:, :] = 0.0
         index = np.unravel_index(int(np.argmax(probe_grad)), grad.shape)
@@ -80,6 +90,8 @@ def best_coordinate_difference(
     analytic: float,
     objective: float,
 ) -> dict[str, Any]:
+    """Try several finite-difference scales and keep the best-conditioned one."""
+
     scale = max(1.0, abs(value))
     trials = []
     for multiplier in [1.0e-4, 3.0e-5, 1.0e-5, 3.0e-6, 1.0e-6, 3.0e-7, 1.0e-7, 3.0e-8]:
@@ -126,6 +138,8 @@ def check_row(
     objective: float,
     trials: list[dict[str, float]] | None = None,
 ) -> dict[str, Any]:
+    """Format one coordinate-check result for JSON output."""
+
     abs_error = abs(analytic - finite_difference)
     denom = max(1.0e-12, abs(analytic), abs(finite_difference))
     return {
@@ -146,6 +160,8 @@ def directional_check(
     variables: VariableDict,
     gradient: VariableDict,
 ) -> dict[str, Any]:
+    """Compare analytic and finite-difference directional derivatives."""
+
     rng = np.random.default_rng(20260525)
     direction: VariableDict = {}
     norm_sq = 0.0
@@ -153,6 +169,8 @@ def directional_check(
         if isinstance(value, np.ndarray):
             raw = rng.normal(size=value.shape)
             if key.endswith("_Q") and raw.ndim == 2 and raw.shape[0] > 20:
+                # Match the coordinate check by reducing boundary-row influence
+                # in the random direction.
                 raw[:8, :] = 0.0
                 raw[-8:, :] = 0.0
             scale = np.linalg.norm(raw)
@@ -206,6 +224,8 @@ def directional_check(
 
 
 def main() -> int:
+    """Run all gradient checks and write the JSON report."""
+
     np.set_printoptions(precision=10, suppress=False)
     model = RankOptimizationModel(DATA_PATH)
     variables = copy_variables(model.variables)

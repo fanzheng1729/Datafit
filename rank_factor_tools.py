@@ -17,6 +17,8 @@ import numpy as np
 
 @dataclass
 class RetractionRefit:
+    """Result bundle from one retraction/refit operation."""
+
     left: np.ndarray
     right: np.ndarray
     singular_values: np.ndarray
@@ -113,6 +115,8 @@ def retract_factors(
     wx = _weights_or_ones(left.shape[0], left_weights)
     wy = _weights_or_ones(right.shape[0], right_weights)
 
+    # Work in weighted coordinates for QR.  Dividing the Q factors by sqrt(W)
+    # converts the orthonormal bases back to the original grid coordinates.
     sqrt_wx = np.sqrt(wx)
     sqrt_wy = np.sqrt(wy)
     q_left_weighted, r_left = np.linalg.qr(sqrt_wx[:, None] * left, mode="reduced")
@@ -120,6 +124,8 @@ def retract_factors(
 
     left_basis = q_left_weighted / sqrt_wx[:, None]
     right_basis = q_right_weighted / sqrt_wy[:, None]
+    # All non-orthonormal scaling is now in this small rank-by-rank core.  Its
+    # SVD restores a sorted, nonnegative explicit singular-value vector.
     core = (r_left * singular_values[None, :]) @ r_right.T
     core_left, new_singular_values, core_right_t = np.linalg.svd(core, full_matrices=False)
 
@@ -161,7 +167,13 @@ def retract_and_refit(
     left_weights: np.ndarray | None = None,
     right_weights: np.ndarray | None = None,
 ) -> RetractionRefit:
-    """Retract evaluated factors and refit them to B-spline coefficients."""
+    """Retract evaluated factors and refit them to B-spline coefficients.
+
+    Optimizer trial steps update coefficients, but the retraction operates on
+    evaluated left/right factors.  The final solve maps the normalized factors
+    back into coefficient space so subsequent gradients still use the same
+    B-spline bases.
+    """
 
     new_left, new_right, new_singular_values = retract_factors(
         left, right, singular_values, left_weights, right_weights
@@ -185,6 +197,8 @@ def retract_and_refit(
 
 
 def _weights_or_ones(size: int, weights: np.ndarray | None) -> np.ndarray:
+    """Validate optional quadrature weights, defaulting to identity weights."""
+
     if weights is None:
         return np.ones(size, dtype=float)
     out = np.asarray(weights, dtype=float)
@@ -198,6 +212,8 @@ def _weights_or_ones(size: int, weights: np.ndarray | None) -> np.ndarray:
 def _check_factor_shapes(
     left: np.ndarray, right: np.ndarray, singular_values: np.ndarray
 ) -> None:
+    """Fail early when a low-rank triple cannot represent one matrix field."""
+
     if left.ndim != 2 or right.ndim != 2:
         raise ValueError("left and right factors must be two-dimensional")
     if singular_values.ndim != 1:
@@ -209,6 +225,8 @@ def _check_factor_shapes(
 
 
 def _fix_right_factor_signs(left: np.ndarray, right: np.ndarray) -> None:
+    """Make right-factor column signs deterministic after SVD."""
+
     for col in range(right.shape[1]):
         pivot = int(np.argmax(np.abs(right[:, col])))
         if right[pivot, col] < 0.0:
@@ -217,11 +235,15 @@ def _fix_right_factor_signs(left: np.ndarray, right: np.ndarray) -> None:
 
 
 def _solve_or_lstsq(system: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Use an exact solve for square bases and least squares otherwise."""
+
     if system.shape[0] == system.shape[1]:
         return np.linalg.solve(system, rhs)
     return np.linalg.lstsq(system, rhs, rcond=None)[0]
 
 
 def _relative_norm(error: np.ndarray, reference: np.ndarray) -> float:
+    """Relative Frobenius norm with an underflow-safe denominator."""
+
     denominator = max(float(np.linalg.norm(reference)), np.finfo(float).tiny)
     return float(np.linalg.norm(error) / denominator)

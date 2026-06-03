@@ -1,5 +1,9 @@
 function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
 
+    % Build sparse BS6 matrices for fields that are even in x1. The y-direction
+    % assembly is copied from BS6_interp; only the x-direction basis and origin
+    % treatment differ.
+
     % Even-x version of BS6_interp.
     %
     % Main changes from the odd-x version:
@@ -15,6 +19,7 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
         error('Too many zeros!');
     end
 
+    % Near- and far-mesh spacings are passed to BS6N for normalization.
     h1 = x1(2) - x1(1);
     h2 = x2(2) - x2(1);
     H1 = x1(end) - x1(end - 1);
@@ -29,6 +34,8 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
     x1 = reshape(x1, 1, N1);
     x2 = reshape(x2, 1, N2);
 
+    % r1 can be either the geometric far-field ratio or a structure carrying a
+    % precomputed extended mesh.
     if ~isstruct(r1)
         ad1 = Meshext(x1, N - 2, "exp", r1);
         ad2 = Meshext(x2, N - 2, "exp", r1);
@@ -40,6 +47,7 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
     xx1 = [-x1(4), -x1(3), -x1(2), x1, ad1];
     xx2 = [-x2(4), -x2(3), -x2(2), x2, ad2];
 
+    % BS{d,1} and BS{d,2} store d-1 derivative matrices in x and y.
     BS = cell(N - 1, 2);
 
     %% X-direction: bulk splines, including the extra even central spline
@@ -63,6 +71,8 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
                 pos = N1 - i - 1;
             end
 
+            % Bi rows are derivative orders, columns are active evaluation
+            % points inside this knot group's support.
             Bi = zeros(ind, len_z);
             [Bi(min(1, ind), 1:end * (ind >= 1)), ...
                 Bi(min(2, ind), 1:end * (ind >= 2)), ...
@@ -95,6 +105,7 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
 
             wBi = Lebni(Bi, Fun(1, :), z_coords);
 
+            % Save sparse triplets for every active point/basis pair.
             x_index(t + 1:t + len_z) = z_indices;
             B_index(t + 1:t + len_z) = i + 1;
             derivs(t + 1:t + len_z, :) = wBi';
@@ -115,6 +126,8 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
             last2 = xx1(end - N:end - 1);
             last = xx1(end - N + 1:end);
 
+            % The last physical bases are closed by two extrapolated support
+            % groups and the BScoe coefficients.
             A1 = zeros(ind, len_z);
             A2 = A1;
 
@@ -226,6 +239,7 @@ function BS = BS6_interp2(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
                 pos = N2 - j - 1;
             end
 
+            % Y-direction bulk basis contribution.
             Bj = zeros(ind, len_z);
             [Bj(min(1, ind), 1:end * (ind >= 1)), ...
                 Bj(min(2, ind), 1:end * (ind >= 2)), ...

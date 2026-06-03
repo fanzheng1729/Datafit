@@ -1,6 +1,9 @@
 function ad = Meshext(x, k, flag, r)
     % Extend the mesh x beyond x(end) for k more grids using two ways. 
     % return ad the extension. It has same form, i.e. row or column vectors as x
+    %
+    % The B-spline builders use this to create the extra far-field supporting
+    % points required by the extrapolated boundary closure.
 
     if flag == "uni"
         % uniform extension

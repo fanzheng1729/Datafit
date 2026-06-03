@@ -1,4 +1,10 @@
-"""Version-aware local dependency path setup for Datafit scripts."""
+"""Version-aware local dependency path setup for Datafit scripts.
+
+The repository is meant to run on machines that may already have NumPy/SciPy,
+but the development workspace also keeps optional local wheel installs.  This
+module finds a compatible local install without making those wheels part of the
+GitHub repo.
+"""
 
 from __future__ import annotations
 
@@ -27,13 +33,19 @@ def add_local_deps(anchor: str | Path) -> Path | None:
 
 
 def current_cp_tag() -> str:
+    """Return the CPython ABI tag used in wheel/platform directory names."""
+
     return f"cp{sys.version_info.major}{sys.version_info.minor}"
 
 
 def _candidate_paths(root: Path) -> list[Path]:
+    """Return local dependency paths from most specific to most general."""
+
     paths: list[Path] = []
     env_path = os.environ.get("DATAFIT_PYTHON_DEPS")
     if env_path:
+        # Let callers override everything, which is useful for one-off testing
+        # without editing the repo or environment-specific scripts.
         paths.append(Path(env_path))
 
     cp_tag = current_cp_tag()
@@ -48,6 +60,7 @@ def _candidate_paths(root: Path) -> list[Path]:
             ]
         )
 
+    # Preserve priority order while avoiding repeated resolved paths.
     unique: list[Path] = []
     seen: set[Path] = set()
     for path in paths:
@@ -59,6 +72,8 @@ def _candidate_paths(root: Path) -> list[Path]:
 
 
 def _looks_compatible(path: Path) -> bool:
+    """Return whether a dependency path is safe for this Python interpreter."""
+
     if not _has_installed_package_markers(path):
         return False
 
@@ -66,6 +81,9 @@ def _looks_compatible(path: Path) -> bool:
     cache_tag = sys.implementation.cache_tag or ""
     found_extensions = False
     try:
+        # Compiled extensions encode their CPython ABI tag in the filename.  If
+        # extensions exist but none match the current interpreter, importing the
+        # directory would fail later with a much less helpful DLL/ABI error.
         for extension in path.rglob("*.pyd"):
             found_extensions = True
             name = extension.name

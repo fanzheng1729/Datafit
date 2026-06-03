@@ -1,5 +1,11 @@
 function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
 
+    % Build sparse one-dimensional BS6 matrices in both coordinate directions.
+    % The returned cell has BS{d,1} for x-direction d-1 derivatives and
+    % BS{d,2} for y-direction d-1 derivatives.
+    %
+    % This is the odd-x version used for omega, zeta, and u1.
+
     % Follow App C.1 in paper II to build the Bspline matrix in i-direction with supporting points on xi,
     %  sum a_ij B_{1,i}(z1) * B_{2,j}(z2) * F2(z2)  = B(z1, i) * A_ij * B(z2, j)' * F2(z2)
     % The spline in x-direction is odd at 0. in y-direction, use extrapolation near the boundary.
@@ -53,6 +59,8 @@ function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
     xx1 = [-x1(4), -x1(3), -x1(2), x1, ad1];
     xx2 = [-x2(4), -x2(3), -x2(2), x2, ad2];
 
+    % Store derivative matrices separately by derivative order and coordinate
+    % direction. The interpolation routines only fill the requested ind rows.
     BS = cell(N - 1, 2);
 
     [x_index, B_index, derivs, t] = prealloc(ind + 1, (N - 2) * N1 + extrap * N);
@@ -76,6 +84,7 @@ function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
                 pos = N1 - i - 1;
             end
 
+            % Bi rows are derivative orders, columns are the selected z points.
             Bi = zeros(ind, len_z);
             [Bi(min(1, ind), 1:end * (ind >= 1)), ...
                 Bi(min(2, ind), 1:end * (ind >= 2)), ...
@@ -103,6 +112,8 @@ function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
             % Lebnize rule, compute  d_x^i ( Bi0 * F1(x)), F1 is x direction wg with d_x^i F1 = Fun(1, i+1)
             wBi = Lebni(Bi, Fun(1, :), z_coords);
 
+            % Accumulate triplets for one sparse matrix entry per
+            % evaluation-point/basis pair.
             x_index(t + 1:t + len_z) = z_indices;
             B_index(t + 1:t + len_z) = i;
             derivs(t + 1:t + len_z, :) = wBi';
@@ -232,6 +243,7 @@ function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
                 pos = N2 - j - 1;
             end
 
+            % Unlike x, y has no odd reflection at the origin in this builder.
             Bj = zeros(ind, len_z);
             [Bj(min(1, ind), 1:end * (ind >= 1)), ...
                 Bj(min(2, ind), 1:end * (ind >= 2)), ...
@@ -340,6 +352,8 @@ function BS = BS6_interp(x1, x2, z1, z2, Fun, r1, extrap, trim, ind)
         nBS = max(B_index2);
     end
 
+    % Y has no origin parity split, so all derivative orders can be assembled
+    % in one pass.
     for ii = 1:ind
         BS{ii, 2} = sparse(x_index2(1:t), B_index2(1:t), derivs2(1:t, ii), length(z2), nBS);
     end

@@ -42,13 +42,23 @@ from rank_optimization_model import (
 
 DEFAULT_OUTPUT_PREFIX = "rank_optimization"
 DEFAULT_MAX_ITERATIONS = 20
+
+# A candidate is accepted only when it beats the current objective by this much
+# and preserves the two fixed gauges.  The tolerance is deliberately above
+# roundoff because many trial steps are extremely small.
 MIN_OBJECTIVE_DECREASE = 1.0e-10
 GAUGE_TOLERANCE = 1.0e-8
+
+# Steps are tiny because the coefficient-space gradient is very large in the
+# velocity derivative blocks.  The line search reuses the previous accepted
+# scale and probes a small bracket around it.
 INITIAL_STEP_SCALE = 3.0e-16
 STEP_MULTIPLIERS = [10.0, 3.0, 1.0, 0.3, 0.1, 0.03, 0.01]
 
 
 def negative_gradient(gradient: VariableDict) -> VariableDict:
+    """Return the raw steepest-descent direction."""
+
     out: VariableDict = {}
     for key, value in gradient.items():
         out[key] = -value if isinstance(value, float) else -value.copy()
@@ -56,6 +66,8 @@ def negative_gradient(gradient: VariableDict) -> VariableDict:
 
 
 def normalize_direction(direction: VariableDict) -> tuple[VariableDict, float]:
+    """Normalize a direction in the current Euclidean coefficient metric."""
+
     norm = variable_norm(direction)
     if norm == 0.0:
         return copy_variables(direction), norm
@@ -70,10 +82,14 @@ def max_abs(values: dict[str, float]) -> float:
 
 
 def residual_rms_summary(model: RankOptimizationModel, evaluation: Evaluation) -> dict[str, float]:
+    """Compact residual magnitudes used in console and JSON output."""
+
     return model.residual_rms_from_residuals(evaluation.residuals)
 
 
 def line_search_steps(step_scale: float) -> list[float]:
+    """Return the trial step lengths around the current trusted scale."""
+
     return [step_scale * multiplier for multiplier in STEP_MULTIPLIERS]
 
 
@@ -84,6 +100,8 @@ def candidate_summary(
     step: float,
     base_objective: float,
 ) -> tuple[dict[str, Any], VariableDict]:
+    """Evaluate a trial step and return only the JSON-safe summary plus state."""
+
     summary, candidate, _ = candidate_summary_with_evaluation(
         model, base_variables, direction, step, base_objective
     )
@@ -97,6 +115,12 @@ def candidate_summary_with_evaluation(
     step: float,
     base_objective: float,
 ) -> tuple[dict[str, Any], VariableDict, Evaluation]:
+    """Evaluate, retract, and classify one line-search candidate.
+
+    Every candidate is retracted before evaluation so the line search measures
+    objective changes on the same explicit-S chart used after accepting a step.
+    """
+
     candidate = add_scaled_variables(base_variables, direction, step)
     candidate = model.retract_variables(candidate)
     evaluation = model.evaluate(candidate)
@@ -122,6 +146,13 @@ def candidate_summary_with_evaluation(
 
 
 def save_state(path: Path, variables: VariableDict) -> None:
+    """Persist the mixed variable dictionary to a compressed NPZ file.
+
+    Arrays are stored under their variable names.  Scalars are packed into two
+    metadata arrays so ``load_state`` helpers can reconstruct the same
+    dictionary without guessing which entries were scalar.
+    """
+
     arrays: dict[str, np.ndarray] = {}
     scalars: dict[str, float] = {}
     for key, value in variables.items():
@@ -145,6 +176,8 @@ def history_row(
     gauge_errors: dict[str, float],
     residuals: dict[str, float],
 ) -> dict[str, float | int]:
+    """Build one CSV row for an accepted optimizer step."""
+
     return {
         "iteration": int(iteration),
         "objective": float(objective),
@@ -164,6 +197,8 @@ def history_row(
 
 
 def write_history_csv(path: Path, rows: list[dict[str, float | int]]) -> None:
+    """Write accepted-step history with stable column order."""
+
     if not rows:
         path.write_text("", encoding="utf-8")
         return
@@ -178,6 +213,8 @@ def choose_best_candidate(
     candidates: list[dict[str, Any]],
     candidate_variables: list[VariableDict],
 ) -> tuple[int | None, VariableDict | None]:
+    """Pick the accepted candidate with the lowest objective."""
+
     passing = [index for index, item in enumerate(candidates) if item["accepted"]]
     if not passing:
         return None, None
@@ -186,6 +223,8 @@ def choose_best_candidate(
 
 
 def output_paths(prefix: str) -> dict[str, Path]:
+    """Resolve result/history/state file names next to this script."""
+
     stem = Path(prefix).name
     return {
         "results": Path(__file__).with_name(f"{stem}_results.json"),
@@ -198,9 +237,14 @@ def run_optimizer(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     output_prefix: str = DEFAULT_OUTPUT_PREFIX,
 ) -> dict[str, Any]:
+    """Run the monitored vanilla projected-gradient optimizer."""
+
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
 
+    # Start from the rank factors fitted from data.mat.  More advanced scripts
+    # can resume from saved states, but this baseline deliberately starts from
+    # the canonical MAT-file fit.
     model = RankOptimizationModel(DATA_PATH)
     variables = copy_variables(model.variables)
     current_evaluation = model.evaluate(variables)
@@ -216,6 +260,9 @@ def run_optimizer(
 
     for iteration in range(1, max_iterations + 1):
         base_objective = model.objective_from_residuals(current_evaluation.residuals)
+
+        # Project before normalizing so the step length has the same meaning
+        # after removing the forbidden gauge directions.
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
         raw_direction = negative_gradient(gradient)
         tangent_direction = model.projected_tangent_direction(variables, raw_direction)
@@ -226,6 +273,9 @@ def run_optimizer(
             stop_reason = "projected direction was not a descent direction"
             break
 
+        # Probe a small multiplicative bracket around the previous accepted
+        # scale.  The best passing candidate is chosen, not merely the first
+        # decrease, because overshoot can be highly nonmonotone here.
         candidates: list[dict[str, Any]] = []
         candidate_variables: list[VariableDict] = []
         candidate_evaluations: list[Evaluation] = []
@@ -247,6 +297,8 @@ def run_optimizer(
         best = candidates[accepted_index]
         variables = accepted_variables
         current_evaluation = candidate_evaluations[accepted_index]
+        # The next iteration trusts the scale that just worked.  This gives the
+        # "variable step size" behavior while keeping the search very simple.
         step_scale = best["step"]
         residuals = residual_rms_summary(model, current_evaluation)
         gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
@@ -283,6 +335,9 @@ def run_optimizer(
     final_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     accepted_count = len(history)
     if accepted_count > 0:
+        # The final state is optional because failed runs still produce a JSON
+        # diagnostic and empty history file, but should not overwrite a useful
+        # state snapshot.
         save_state(paths["state"], variables)
 
     return {
@@ -312,6 +367,8 @@ def run_optimizer(
 
 
 def parse_args(argv: list[str] | None = None) -> Namespace:
+    """Parse command-line options without doing any numerical work."""
+
     parser = ArgumentParser(
         description="Run the monitored explicit-S rank-factor gradient optimizer."
     )
@@ -334,6 +391,8 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point."""
+
     args = parse_args(argv)
     np.set_printoptions(precision=10, suppress=False)
     print("Monitored explicit-S rank-factor gradient optimization")

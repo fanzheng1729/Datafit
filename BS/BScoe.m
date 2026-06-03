@@ -1,6 +1,10 @@
 function coemat = BScoe(N, rows)
 
     % Compute the coefficients of B-splines used for extrapolation.
+    % The rows close the far boundary by expressing the last physical basis
+    % functions as combinations of two extrapolated knot groups. BS6_interp and
+    % BS6_interp2 use the same coefficients so the odd/even x-parity choice
+    % does not change the far-field closure.
 
     % BScoe(7) =
     % 28 -112 210 -224 140 -48 7
@@ -14,6 +18,7 @@ function coemat = BScoe(N, rows)
     if nargin == 1
         rows = floor(N / 2) - 1;
     end
+    % Vectorized form of the combinatorial formula from Appendix C.1.
     [I, J] = ndgrid(rows - 1:-1:0, 1:N);
     coemat = arrayfun(@(i, j) ...
         (-1)^(j - 1) * nchoosek(N + i, i + j) * nchoosek(i + j - 1, i), ...

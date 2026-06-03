@@ -1,5 +1,13 @@
 function [b, bx, bxx, bxxx, bx4, bx5, Nor] = BS6N(x, s, k, id1, id2, h, H, ind)
 
+    % Evaluate one compactly supported normalized B-spline and, optionally,
+    % its first five derivatives at the points x. The interpolation builders
+    % call this repeatedly for each local knot group.
+    %
+    % Outputs:
+    %   b, bx, ... are derivative rows d_x^j B(x).
+    %   Nor exposes the per-knot normalization constants used in the formula.
+
     % Follow the formula in App C.1 in Paper II to evaluate one B-spline function.
     %   B(x) =   sum_{0 <= j <= k} k (sj - x)^{k-1} * one_{sj-x >= 0} / d_j,      (1)
     %        = - sum_{0 <= j <=k } k (sj - x)^{k-1} * one_{sj-x < 0} / d_j,      (2)
@@ -18,6 +26,8 @@ function [b, bx, bxx, bxxx, bx4, bx5, Nor] = BS6N(x, s, k, id1, id2, h, H, ind)
     % It is used for choosing normalization constant to reduce condition number, h for near, and hh for far-field.
     % If id1 or id2 > 8 then the normalization factor independdent of localtion
 
+    % The original verified MATLAB code also supports interval arithmetic.
+    % Keep the same branches so non-double interval inputs remain usable.
     itl = ~isa(x, 'double') || ~isa(s, 'double'); % Check interval input
 
     if nargin == 7
@@ -66,6 +76,9 @@ function [b, bx, bxx, bxxx, bx4, bx5, Nor] = BS6N(x, s, k, id1, id2, h, H, ind)
         d(i) = prod(v);
     end
 
+    % The sign expression chooses formula (1) or (2) above without explicitly
+    % branching per point. That is important near knots, where the two
+    % algebraically identical sums have different roundoff behavior.
     if itl
         sgn = (sign_itl(max(s - x, 0)) - issm) .* isspt;
     else

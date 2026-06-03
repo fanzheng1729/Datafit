@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Check retraction/refit using the shared explicit-S optimization model."""
+"""Check retraction/refit using the shared explicit-S optimization model.
+
+The optimizer relies on retraction after every trial point.  This script
+deliberately rescales equivalent left/right factors, retracts them, refits them
+to B-spline coefficients, and verifies that the represented field is preserved.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,8 @@ RESULTS_PATH = Path(__file__).with_name("retraction_check_results.json")
 
 
 def evaluated_core(core: RankCore, variables: VariableDict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return evaluated left/right factors and singular values for one core."""
+
     p = variables[core.p_key]
     q = variables[core.q_key]
     s = variables[core.s_key]
@@ -36,10 +43,15 @@ def check_core(
     left_weights: np.ndarray | None,
     right_weights: np.ndarray | None,
 ) -> dict[str, Any]:
+    """Stress one core by applying a harmless column-rescaling symmetry."""
+
     left, right, singular_values = evaluated_core(core, variables)
     baseline_field = synthesize(left, right, singular_values)
 
     rank = singular_values.size
+    # Multiplying left columns and dividing right columns by the same values
+    # leaves the represented matrix unchanged but moves far from the normalized
+    # explicit-S chart.
     scaling = np.geomspace(0.25, 4.0, rank)
     scaled_left = left * scaling[None, :]
     scaled_right = right / scaling[None, :]
@@ -81,6 +93,8 @@ def summarize_checks(
     right_weights: np.ndarray | None,
     thresholds: dict[str, float],
 ) -> tuple[bool, dict[str, Any]]:
+    """Run the retraction/refit check for every optimized core."""
+
     core_results = {
         core.name: check_core(core, variables, left_weights, right_weights)
         for core in model.cores
@@ -97,6 +111,8 @@ def summarize_checks(
 
 
 def main() -> int:
+    """Run primary and trapezoid-weight stress checks."""
+
     model = RankOptimizationModel(DATA_PATH)
     variables = model.variables
     x1_trapezoid_weights = trapezoid_weights(model.x1)
@@ -106,6 +122,9 @@ def main() -> int:
         "gram_error": 1.0e-10,
         "refit_relative_error": 1.0e-10,
     }
+    # Identity weights match the current optimizer chart.  The trapezoid pass is
+    # retained as a stress check because the adaptive grid has an enormous
+    # dynamic range in cell sizes.
     passed, core_results = summarize_checks(model, variables, None, None, thresholds)
     trapezoid_passed, trapezoid_results = summarize_checks(
         model, variables, x1_trapezoid_weights, x2_trapezoid_weights, thresholds

@@ -56,11 +56,21 @@ from rank_optimization_model import (
 DEFAULT_STATE = Path("compare_curl_trust_rank_optimization_state.npz")
 DEFAULT_PQ_DIAGNOSTIC = Path("pq_support_step_scaling_diagnostic_results.json")
 DEFAULT_OUTPUT_PREFIX = "pq_rowband_rank_optimization"
+
+# The large-gradient localization diagnostics showed that useful progress comes
+# from the velocity P/Q coefficient blocks.  The row-band mode therefore leaves
+# omega/zeta/scalar variables untouched and shapes only these four blocks.
 TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
+
+# Optional extra shrink factors are useful for exploratory runs from difficult
+# states.  The committed 3e-4 result used ``--no-extra-shrinks`` so it matches
+# the original seven-point vanilla bracket.
 EXTRA_SHRINKS = [0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001]
 
 
 def load_state(path: Path) -> VariableDict:
+    """Load a saved optimizer state produced by ``save_state``."""
+
     data = np.load(path, allow_pickle=True)
     variables: VariableDict = {}
     scalar_names = [str(name) for name in data["_scalar_names"]]
@@ -75,6 +85,8 @@ def load_state(path: Path) -> VariableDict:
 
 
 def objective_components(model: RankOptimizationModel, residuals: dict[str, np.ndarray]) -> dict[str, float]:
+    """Return the four weighted objective components separately."""
+
     return {
         "fomega": float(0.5 * np.mean((residuals["fomega"] / model.scales["fomega"]) ** 2)),
         "fzeta": float(0.5 * np.mean((residuals["fzeta"] / model.scales["fzeta"]) ** 2)),
@@ -92,6 +104,8 @@ def objective_components(model: RankOptimizationModel, residuals: dict[str, np.n
 
 
 def zero_like_variables(variables: VariableDict) -> VariableDict:
+    """Return a zero variable dictionary with the same shape as ``variables``."""
+
     return {
         key: np.zeros_like(value) if isinstance(value, np.ndarray) else 0.0
         for key, value in variables.items()
@@ -99,6 +113,8 @@ def zero_like_variables(variables: VariableDict) -> VariableDict:
 
 
 def raw_pq_direction(variables: VariableDict, gradient: VariableDict) -> VariableDict:
+    """Use only the unscaled velocity P/Q part of the negative gradient."""
+
     direction = zero_like_variables(variables)
     for block in TARGET_BLOCKS:
         value = gradient[block]
@@ -112,6 +128,14 @@ def rowband_pq_direction(
     gradient: VariableDict,
     pq_diagnostic: dict[str, Any],
 ) -> VariableDict:
+    """Build the measured row-band-scaled P/Q descent direction.
+
+    The diagnostic JSON stores, for each coordinate row band, the largest
+    accepted unit-norm step found in isolation.  This function converts each
+    band of the raw gradient into a chunk whose norm is that safe step, giving
+    high-curvature near-axis rows much less movement than safer far-field rows.
+    """
+
     direction = zero_like_variables(variables)
     for block in TARGET_BLOCKS:
         block_gradient = gradient[block]
@@ -125,6 +149,9 @@ def rowband_pq_direction(
             chunk = block_gradient[rows, :]
             norm = float(np.linalg.norm(chunk))
             if norm > 0.0:
+                # This is the core preconditioner: preserve the local descent
+                # direction but replace its raw magnitude with the safe
+                # row-band step measured by the diagnostic.
                 block_direction[rows, :] = -chunk * (safe_step / norm)
         direction[block] = block_direction
     return direction
@@ -136,6 +163,8 @@ def raw_direction_for_mode(
     gradient: VariableDict,
     pq_diagnostic: dict[str, Any] | None,
 ) -> VariableDict:
+    """Select the raw direction family requested by ``--mode``."""
+
     if mode == "vanilla":
         return negative_gradient(gradient)
     if mode == "raw_pq":
@@ -148,6 +177,8 @@ def raw_direction_for_mode(
 
 
 def line_search_steps(step_scale: float, *, include_extra_shrinks: bool) -> list[float]:
+    """Return trial step lengths for the current mode and trusted scale."""
+
     multipliers = list(STEP_MULTIPLIERS)
     if include_extra_shrinks:
         multipliers.extend(EXTRA_SHRINKS)
@@ -162,6 +193,8 @@ def candidate_with_components(
     base_objective: float,
     base_components: dict[str, float],
 ) -> tuple[dict[str, Any], VariableDict, Evaluation]:
+    """Evaluate one candidate and attach per-equation component changes."""
+
     summary, candidate, evaluation = candidate_summary_with_evaluation(
         model,
         variables,
@@ -179,6 +212,8 @@ def candidate_with_components(
 
 
 def component_history_fields(components: dict[str, float]) -> dict[str, float]:
+    """Flatten component losses into CSV-friendly fields."""
+
     return {
         f"{name}_loss": float(value)
         for name, value in components.items()
@@ -197,11 +232,20 @@ def run_optimizer(
     include_extra_shrinks: bool,
     constraint_weight: float,
 ) -> dict[str, Any]:
+    """Run a saved-state optimizer comparison.
+
+    ``vanilla`` and ``raw_pq`` modes are controls.  ``rowband_pq`` is the pushed
+    recommendation: it uses the measured band scales as the natural direction
+    magnitude, then still performs an ordinary line search/retraction check.
+    """
+
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
 
     model = RankOptimizationModel(DATA_PATH, constraint_weight=constraint_weight)
     variables = load_state(state_path)
+    # Only row-band mode needs the diagnostic, but accepting an optional path
+    # keeps the JSON output comparable across modes.
     pq_diagnostic = None
     if pq_diagnostic_path is not None and pq_diagnostic_path.exists():
         pq_diagnostic = json.loads(pq_diagnostic_path.read_text(encoding="utf-8"))
@@ -237,8 +281,14 @@ def run_optimizer(
 
         search_scale = step_scale
         if mode == "rowband_pq" and rowband_use_natural_step:
+            # The row-band direction norm is already in units of "largest safe
+            # unit-band steps", so using it as the line-search scale avoids
+            # collapsing back to the tiny vanilla gradient step size.
             search_scale = direction_norm_before_normalization
 
+        # Trial points follow the same discipline as the vanilla optimizer:
+        # update coefficients, retract/refit, evaluate residuals, reject gauge
+        # drift, then choose the lowest accepted objective.
         candidates: list[dict[str, Any]] = []
         candidate_variables: list[VariableDict] = []
         candidate_evaluations: list[Evaluation] = []
@@ -265,6 +315,9 @@ def run_optimizer(
         best = candidates[accepted_index]
         variables = accepted_variables
         current_evaluation = candidate_evaluations[accepted_index]
+        # Preserve the best accepted scalar as the next trusted scale.  In
+        # row-band mode this mainly matters when ``--fixed-rowband-step-scale``
+        # is used; otherwise the natural row-band norm resets it each iteration.
         step_scale = float(best["step"])
         residuals = residual_rms_summary(model, current_evaluation)
         gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
@@ -306,6 +359,8 @@ def run_optimizer(
     final_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     accepted_count = len(history)
     if accepted_count > 0:
+        # Save the accepted endpoint so users can inspect or continue the exact
+        # state corresponding to the JSON/CSV result.
         save_state(paths["state"], variables)
 
     return {
@@ -345,6 +400,8 @@ def run_optimizer(
 
 
 def parse_args(argv: list[str] | None = None) -> Namespace:
+    """Parse saved-state comparison options."""
+
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
@@ -371,6 +428,8 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point."""
+
     args = parse_args(argv)
     np.set_printoptions(precision=10, suppress=False)
     output = run_optimizer(

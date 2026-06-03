@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Compare constrained/retracted +gradient and -gradient trial steps."""
+"""Compare constrained/retracted +gradient and -gradient trial steps.
+
+This is a sanity check for optimizer sign conventions.  Because every trial is
+also gauge-projected and retracted, the script tests the same path that the
+optimizer uses rather than only the raw analytic directional derivative.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +32,9 @@ from rank_optimization_model import (
 STATE_NPZ = Path(__file__).with_name("rank_optimization_state.npz")
 RESULTS_PATH = Path(__file__).with_name("gradient_direction_sign_test.json")
 GAUGE_TOLERANCE = 1.0e-8
+
+# Probe from "too large" to "roundoff-sized" so the JSON report shows both
+# overshoot and the tiny accepted-step regime.
 STEPS = [
     3.0e-15,
     1.0e-15,
@@ -46,6 +54,8 @@ STEPS = [
 
 
 def load_state(path: Path) -> VariableDict:
+    """Load a saved optimizer state if one exists beside this script."""
+
     data = np.load(path, allow_pickle=True)
     variables: VariableDict = {}
     scalar_names = [str(item) for item in data["_scalar_names"]]
@@ -64,6 +74,8 @@ def max_abs(values: dict[str, float]) -> float:
 
 
 def normalize(direction: VariableDict) -> tuple[VariableDict, float]:
+    """Normalize a mixed variable dictionary in coefficient Euclidean norm."""
+
     norm = variable_norm(direction)
     out = copy_variables(direction)
     if norm == 0.0:
@@ -79,6 +91,8 @@ def signed_direction(
     gradient: VariableDict,
     sign: float,
 ) -> tuple[VariableDict, float]:
+    """Build either the projected +gradient or projected -gradient direction."""
+
     raw: VariableDict = {}
     for key, value in gradient.items():
         raw[key] = sign * value if isinstance(value, float) else sign * value.copy()
@@ -92,6 +106,8 @@ def trial_rows(
     direction: VariableDict,
     objective: float,
 ) -> list[dict[str, Any]]:
+    """Evaluate the configured trial steps along one signed direction."""
+
     rows: list[dict[str, Any]] = []
     for step in STEPS:
         candidate = add_scaled_variables(variables, direction, step)
@@ -116,7 +132,12 @@ def analyze_start(
     name: str,
     variables: VariableDict,
 ) -> dict[str, Any]:
+    """Analyze plus/minus gradient behavior from one starting state."""
+
     objective = model.objective(variables)
+    # Retraction alone can shift the objective slightly.  Reporting the
+    # zero-step retracted objective separates that chart effect from the signed
+    # direction effect.
     zero_retracted = model.retract_variables(variables)
     zero_retracted_objective = model.objective(zero_retracted)
     gradient = model.analytic_gradient(variables)
@@ -152,6 +173,8 @@ def analyze_start(
 
 
 def main() -> int:
+    """Run the sign test from the baseline and optional saved final state."""
+
     model = RankOptimizationModel(DATA_PATH)
     starts = [("baseline", copy_variables(model.variables))]
     if STATE_NPZ.exists():

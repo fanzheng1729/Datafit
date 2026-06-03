@@ -15,6 +15,10 @@ fprintf("  output prefix:            %s\n", opts.outputPrefix);
 
 model = build_model();
 variables = copy_variables(model.variables);
+
+% The optimizer always evaluates the objective through the normalized
+% residuals in model.scales. That keeps the four equations comparable even
+% though the physical RMS sizes differ by many orders of magnitude.
 current_evaluation = evaluate_model(model, variables);
 initial_objective = objective_from_residuals(model, current_evaluation.residuals);
 initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
@@ -29,6 +33,10 @@ for iteration = 1:opts.maxIterations
     base_objective = objective_from_residuals(model, current_evaluation.residuals);
     gradient = analytic_gradient(model, variables, current_evaluation);
     raw_direction = scale_variables(gradient, -1.0, model.variableKeys);
+
+    % Project the raw negative gradient into the tangent space of the origin
+    % gauges before trying any step. This keeps c_l and c_omega tied to the
+    % normalization conditions used by the dynamic-rescaling equations.
     tangent_direction = projected_tangent_direction(model, variables, raw_direction);
     [direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
     gradient_norm = variable_norm(gradient, model.variableKeys);
@@ -44,6 +52,8 @@ for iteration = 1:opts.maxIterations
     candidate_variables = cell(numel(steps), 1);
     candidate_evaluations = cell(numel(steps), 1);
     for k = 1:numel(steps)
+        % Each trial is retracted after stepping so P/Q/S return to the
+        % orthonormal chart before the objective and gauge checks are made.
         [summary, candidate, candidate_evaluation] = candidate_summary( ...
             model, variables, direction, steps(k), base_objective, opts);
         summary.iteration = iteration;
@@ -136,6 +146,9 @@ fprintf("  wrote results:             %s\n", paths.results);
 end
 
 function opts = parse_optimizer_options(varargin)
+% Parse name-value options while preserving the simple optimize_rank_factors(N)
+% shorthand used for smoke tests.
+
 opts = struct();
 opts.maxIterations = 20;
 opts.outputPrefix = "matlab_rank_optimization";
@@ -178,6 +191,9 @@ end
 end
 
 function paths = output_paths(prefix)
+% Keep result, history, and restart state filenames mechanically tied to one
+% prefix so a run can be archived without guessing which files belong together.
+
 prefix = char(prefix);
 paths = struct();
 paths.results = sprintf("%s_results.json", prefix);
@@ -186,6 +202,12 @@ paths.state = sprintf("%s_state.mat", prefix);
 end
 
 function model = build_model()
+% Build every fixed quantity needed by the reduced rank-factor objective.
+%
+% The dependent variables are omega, zeta, u1, and u2. Each is represented by
+% P*S*Q' in a spline basis after applying the same damping/profile factors used
+% by runfit.m. The PDE residuals then operate on reconstructed physical fields.
+
 data = load("data.mat");
 model = struct();
 model.x1 = double(data.x1(:));
@@ -215,6 +237,8 @@ factor0u2 = 1 + model.x2Row.^2;
 model.u2Factor = factor0u2 .^ 0.25;
 model.u2FactorX2 = 0.5 * model.x2Row .* model.u2Factor ./ factor0u2;
 
+% Store one core per fitted field. Odd parity is used for omega, zeta, and u1;
+% u2 is even at x1 = 0 and therefore uses BS6_interp2.
 model.cores = [
     build_rank_core("omega", omega ./ model.profileFactor, model.x1, model.x2, 1, 1.0e-10)
     build_rank_core("zeta", zeta ./ model.profileFactor, model.x1, model.x2, 1, 1.0e-10)
@@ -223,6 +247,8 @@ model.cores = [
 ];
 model.coreNames = string({model.cores.name});
 
+% The far-field stream-function piece is not optimized; it is rebuilt once and
+% added to the finite velocity factors during evaluation.
 model.fixedVelocity = build_fixed_velocity(data, model);
 cl = 4.0 * double(data.vx1(1, 1)) / double(data.wx1(1, 1));
 cw = double(data.Vel.u1dx1(1, 1)) + cl / 2.0;
@@ -238,11 +264,17 @@ for k = 1:numel(model.cores)
 end
 model.arrayKeys = build_array_keys(model);
 model.variableKeys = [model.arrayKeys, "cl", "cw"];
+
+% Start from a normalized chart. Retraction sorts singular values and makes
+% the left/right factors orthonormal under the grid inner product.
 model.variables = retract_variables(model, variables, true, 1.0e-10);
 
 base = evaluate_model(model, model.variables);
 model.gaugeTargets = gauge_values_from_fields(base.fields);
 model.scales = struct();
+% These scales define J = 1/2 mean((residual / initial_rms)^2). The constraint
+% weight controls the relative pull of divergence and curl in this MATLAB
+% reference optimizer.
 model.scales.fomega = max(rms_all(base.residuals.fomega), realmin);
 model.scales.fzeta = max(rms_all(base.residuals.fzeta), realmin);
 model.scales.divergence = max(rms_all(base.residuals.divergence), realmin);
@@ -250,6 +282,8 @@ model.scales.curl = max(rms_all(base.residuals.curl), realmin);
 end
 
 function keys = build_array_keys(model)
+% Flatten the P/Q/S field names into a stable order for vector-space helpers.
+
 keys = strings(1, 3 * numel(model.cores));
 index = 1;
 for k = 1:numel(model.cores)
@@ -260,6 +294,9 @@ end
 end
 
 function fixed = build_fixed_velocity(data, model)
+% Reconstruct the semi-analytic far-field velocity correction from the stored
+% angular spline coefficients and polar derivative tables.
+
 rat = double(data.rec(7));
 xycoe = XYcoef(double(data.gx1(:)), double(data.gx2(:)), double(data.alpha_b), data.Chi20, data.AG);
 psi1 = Deri_Psi1(numel(data.gx1), numel(data.gx2), double(data.p_ag_coe), data.BS1d_large, 2, xycoe);
@@ -276,6 +313,11 @@ fixed.u2x2 = rat * psi1(1:n1, 1:n2, 2, 2);
 end
 
 function core = build_rank_core(name, values, x1, x2, parity, epsSVD)
+% Create the low-rank spline chart for one dependent field.
+%
+% values is the damped/scaled field to fit. The SVD decides the rank; the
+% spline solves convert singular vectors into P and Q coefficient matrices.
+
 [u, s_matrix, v] = svd(values, "econ");
 s = diag(s_matrix);
 rank = svd_order(u, s, v, epsSVD);
@@ -287,6 +329,8 @@ if parity == 1
 end
 mat = BS6mat(x1, x2, 2, parity);
 if parity == 1
+    % Odd fields vanish at the origin, so the first row would be a redundant
+    % zero equation in the coefficient solve.
     p = mat{1, 1}(2:end, :) \ u(2:end, :);
 else
     p = mat{1, 1} \ u;
@@ -309,6 +353,9 @@ core.sKey = sprintf("%s_s", name);
 end
 
 function n = svd_order(u, s, v, epsSVD)
+% Keep singular vectors until the RMS-scaled rank-one contribution is below
+% the requested tolerance.
+
 n = numel(s);
 for k = 1:n
     if rms_all(u(:, k)) * s(k) * rms_all(v(:, k)) <= epsSVD
@@ -319,6 +366,9 @@ end
 end
 
 function evaluation = evaluate_model(model, variables)
+% Reconstruct physical fields, their first derivatives, and all equation
+% residuals from the current rank-factor variables.
+
 cache = struct();
 for k = 1:numel(model.cores)
     core = model.cores(k);
@@ -331,6 +381,8 @@ u1_core = cache.u1;
 u2_core = cache.u2;
 
 fields = struct();
+% Undo the profile/damping factors and apply their product-rule derivative
+% corrections. The velocity fields also receive the fixed far-field correction.
 fields.omega = model.profileFactor .* omega_core.value;
 fields.omega_x1 = model.profileFactor .* omega_core.x1 + model.profileFactorX1 .* omega_core.value;
 fields.omega_x2 = model.profileFactor .* omega_core.x2 + model.profileFactorX2 .* omega_core.value;
@@ -347,6 +399,8 @@ fields.u2x2 = model.u2Factor .* u2_core.x2 + model.u2FactorX2 .* u2_core.value +
 cl = variables.cl;
 cw = variables.cw;
 residuals = struct();
+% The four residuals are Fomega, Fzeta, incompressibility, and vorticity-curl
+% consistency. These are the four terms in the objective.
 residuals.fomega = Fomega(cl, cw, model.x1Col, model.x2Row, fields.omega, fields.zeta, ...
     fields.omega_x1, fields.omega_x2, fields.u1, fields.u2, fields.zeta_x1);
 residuals.fzeta = Fzeta(cl, cw, model.x1Col, model.x2Row, fields.zeta, fields.zeta_x1, ...
@@ -361,6 +415,8 @@ evaluation.coreCache = cache;
 end
 
 function cache = core_eval(core, variables)
+% Evaluate one P*S*Q' field and its x1/x2 derivatives in spline space.
+
 p = variables.(core.pKey);
 q = variables.(core.qKey);
 s = variables.(core.sKey);
@@ -381,6 +437,8 @@ cache.x2 = x2_derivative;
 end
 
 function [value, x1_derivative, x2_derivative] = synthesize_triplet(left, left_x1, right, right_x2, s)
+% Matrix form of left*diag(s)*right' plus the two first derivatives.
+
 weighted_left = left .* reshape(s, 1, []);
 weighted_left_x1 = left_x1 .* reshape(s, 1, []);
 value_and_x1 = [weighted_left; weighted_left_x1] * right';
@@ -396,6 +454,9 @@ value = objective_from_residuals(model, evaluation.residuals);
 end
 
 function value = objective_from_residuals(model, residuals)
+% The objective is a normalized least-squares loss. Divergence and curl share
+% the constraintWeight knob so their influence can be damped or emphasized.
+
 value = 0.5 * mean((residuals.fomega ./ model.scales.fomega) .^ 2, "all") ...
     + 0.5 * mean((residuals.fzeta ./ model.scales.fzeta) .^ 2, "all") ...
     + 0.5 * model.constraintWeight * mean((residuals.divergence ./ model.scales.divergence) .^ 2, "all") ...
@@ -415,6 +476,8 @@ out = residual_rms_from_residuals(evaluate_model(model, variables).residuals);
 end
 
 function values = gauge_values_from_fields(fields)
+% Origin gauges used to define the dynamic-rescaling rates.
+
 values = struct();
 values.omega_x1_00 = fields.omega_x1(1, 1);
 values.theta_x1x1_00 = 2.0 * fields.zeta_x1(1, 1);
@@ -436,6 +499,9 @@ errors = gauge_errors_from_fields(model, evaluate_model(model, variables).fields
 end
 
 function lam = residual_lambdas(model, residuals)
+% Derivative of the objective with respect to each residual array. These
+% adjoint weights are propagated backward to field values and rank factors.
+
 n = model.nGrid;
 lam = struct();
 lam.fomega = residuals.fomega ./ (model.scales.fomega ^ 2 * n);
@@ -445,6 +511,8 @@ lam.curl = model.constraintWeight * residuals.curl ./ (model.scales.curl ^ 2 * n
 end
 
 function gradient = analytic_gradient(model, variables, evaluation)
+% Analytic gradient of J with respect to every P/Q/S factor plus cl and cw.
+
 if nargin < 3
     evaluation = [];
 end
@@ -459,6 +527,7 @@ gradient.cl = sum(lam.fomega .* (-(model.x1Col .* fields.omega_x1 + model.x2Row 
     + sum(lam.fzeta .* (-(model.x1Col .* fields.zeta_x1 + model.x2Row .* fields.zeta_x2)), "all");
 gradient.cw = sum(lam.fomega .* fields.omega, "all") + sum(lam.fzeta .* (2.0 * fields.zeta), "all");
 
+% Push field adjoints through the damping factors and the spline/SVD chart.
 gradient = add_rank_gradient(model, gradient, "omega", fg.omega.value, fg.omega.x1, fg.omega.x2, ...
     evaluation.coreCache.omega, model.profileFactor, model.profileFactorX1, model.profileFactorX2);
 gradient = add_rank_gradient(model, gradient, "zeta", fg.zeta.value, fg.zeta.x1, fg.zeta.x2, ...
@@ -470,6 +539,9 @@ gradient = add_rank_gradient(model, gradient, "u2", fg.u2.value, fg.u2.x1, fg.u2
 end
 
 function fg = field_gradient(model, variables, evaluation)
+% Collect dJ/d(field), dJ/d(field_x1), and dJ/d(field_x2) for each physical
+% dependent variable before applying profile factors and spline matrices.
+
 if nargin < 3 || isempty(evaluation)
     evaluation = evaluate_model(model, variables);
 end
@@ -480,6 +552,8 @@ cw = variables.cw;
 a1 = cl * model.x1Col + fields.u1;
 a2 = cl * model.x2Row + fields.u2;
 h_adjoint = zeros(size(fields.u1));
+% The zeta residual contains u1/x1. At x1 = 0 the term is defined by the gauge
+% limit and is handled as zero in this discrete residual.
 h_adjoint(2:end, :) = (fields.zeta(2:end, :) .* lam.fzeta(2:end, :)) ./ model.x1(2:end);
 
 fg = struct();
@@ -503,11 +577,16 @@ fg.u2 = struct( ...
 end
 
 function out = u1_over_x1(model, u1)
+% Safe discrete version of u1 / x1, leaving the origin row at zero.
+
 out = zeros(size(u1));
 out(2:end, :) = u1(2:end, :) ./ model.x1(2:end);
 end
 
 function gradient = add_rank_gradient(model, gradient, name, g_value, g_x1, g_x2, cache, factor, factor_x1, factor_x2)
+% Chain the field adjoint through scaling factors, derivative matrices, and
+% the bilinear P*S*Q' representation for one core.
+
 core = get_core(model, name);
 g_core = factor .* g_value + factor_x1 .* g_x1 + factor_x2 .* g_x2;
 g_core_x1 = factor .* g_x1;
@@ -540,6 +619,8 @@ core = model.cores(index);
 end
 
 function gauges = gauge_gradients(model, variables)
+% Gradients of the two scalar gauge constraints used by the tangent projection.
+
 zero = zero_like_variables(variables, model.variableKeys);
 gauges = struct();
 gauges.omega_x1_00 = single_gauge_gradient(model, "omega", variables, 1.0, zero);
@@ -547,6 +628,8 @@ gauges.theta_x1x1_00 = single_gauge_gradient(model, "zeta", variables, 2.0, zero
 end
 
 function out = single_gauge_gradient(model, name, variables, scale, template)
+% Gauge gradients only touch the origin row/column of the relevant core.
+
 core = get_core(model, name);
 cache = core_eval(core, variables);
 factor = model.profileFactor(1, 1);
@@ -563,6 +646,9 @@ out.(core.sKey) = scale * (factor * left_x1 .* right + factor_x1 * left .* right
 end
 
 function projected = projected_tangent_direction(model, variables, raw_direction)
+% Remove components of raw_direction that would change the origin gauges to
+% first order. The tiny 2x2 solve is the Gram projection in variable space.
+
 gauges = gauge_gradients(model, variables);
 names = ["omega_x1_00", "theta_x1x1_00"];
 gram = zeros(2, 2);
@@ -590,6 +676,8 @@ end
 end
 
 function variables = retract_variables(model, variables, force, tolerance)
+% Move every core back to the normalized P/S/Q chart after a trial step.
+
 variables = copy_variables(variables);
 for k = 1:numel(model.cores)
     core = model.cores(k);
@@ -607,6 +695,8 @@ end
 end
 
 function ok = core_chart_is_normalized(core, variables, tolerance)
+% Decide whether a core is already close enough to the orthonormal chart.
+
 errors = core_chart_errors(core, variables);
 ok = errors.left_gram_error <= tolerance ...
     && errors.right_gram_error <= tolerance ...
@@ -615,6 +705,9 @@ ok = errors.left_gram_error <= tolerance ...
 end
 
 function errors = core_chart_errors(core, variables)
+% Diagnostics for the chart constraints: left/right orthonormality and sorted
+% nonnegative singular values.
+
 left = core.x0 * variables.(core.pKey);
 right = core.y0 * variables.(core.qKey);
 s = variables.(core.sKey);
@@ -631,6 +724,9 @@ errors.singular_negative_violation = negative_violation;
 end
 
 function result = retract_and_refit(left, right, s, xBasis, yBasis, parity)
+% Retract in value space, then refit the normalized factors back to spline
+% coefficients. Odd x-parity again skips the origin row in the solve.
+
 [new_left, new_right, new_s] = retract_factors(left, right, s);
 if parity == 1
     p = xBasis(2:end, :) \ new_left(2:end, :);
@@ -645,6 +741,8 @@ result.singularValues = new_s(:);
 end
 
 function [new_left, new_right, new_s] = retract_factors(left, right, s)
+% QR-compress the two factor spaces, SVD the small core, and expand back.
+
 [q_left, r_left] = qr(left, 0);
 [q_right, r_right] = qr(right, 0);
 core = r_left * diag(s(:)) * r_right';
@@ -656,6 +754,9 @@ new_s = diag(s_matrix);
 end
 
 function [left, right] = fix_right_factor_signs(left, right)
+% Fix SVD sign ambiguity by making the largest entry in each right factor
+% positive. This keeps saved states stable across platforms.
+
 for col = 1:size(right, 2)
     [~, pivot] = max(abs(right(:, col)));
     if right(pivot, col) < 0
@@ -666,11 +767,15 @@ end
 end
 
 function value = weighted_orthonormality_error(factors)
+% Grid weights are uniform here, so orthonormality is the ordinary Gram error.
+
 gram = factors' * factors;
 value = norm(gram - eye(size(gram)), "fro");
 end
 
 function [summary, candidate, candidate_evaluation] = candidate_summary(model, base_variables, direction, step, base_objective, opts)
+% Build one line-search candidate and record the fields needed for acceptance.
+
 candidate = add_scaled_variables(base_variables, direction, step, model.variableKeys);
 candidate = retract_variables(model, candidate, false, 1.0e-10);
 candidate_evaluation = evaluate_model(model, candidate);
@@ -688,6 +793,8 @@ summary.max_abs_gauge_error = max_abs_struct(gauge_errors);
 end
 
 function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals)
+% CSV-friendly record for one accepted step.
+
 row = struct();
 row.iteration = iteration;
 row.objective = value;
@@ -710,6 +817,8 @@ function variables = copy_variables(variables)
 end
 
 function out = zero_like_variables(variables, keys)
+% Allocate a variable-shaped struct of zeros.
+
 out = struct();
 for key = keys
     key = char(key);
@@ -718,6 +827,8 @@ end
 end
 
 function out = scale_variables(variables, scale, keys)
+% Scalar multiplication in the product variable space.
+
 out = struct();
 for key = keys
     key = char(key);
@@ -726,6 +837,8 @@ end
 end
 
 function out = add_scaled_variables(base, direction, scale, keys)
+% Affine update base + scale * direction.
+
 out = copy_variables(base);
 for key = keys
     key = char(key);
@@ -734,6 +847,8 @@ end
 end
 
 function value = variable_dot(left, right, keys)
+% Euclidean product over all array variables and scalar rates.
+
 value = 0.0;
 for key = keys
     key = char(key);
@@ -746,6 +861,8 @@ value = sqrt(max(variable_dot(variables, variables, keys), 0.0));
 end
 
 function [out, value] = normalize_direction(direction, keys)
+% Normalize a direction while returning its original norm.
+
 value = variable_norm(direction, keys);
 out = copy_variables(direction);
 if value == 0
@@ -758,6 +875,8 @@ end
 end
 
 function value = max_abs_struct(values)
+% Maximum absolute entry over all fields in a scalar-diagnostic struct.
+
 names = fieldnames(values);
 value = 0.0;
 for k = 1:numel(names)
@@ -766,6 +885,8 @@ end
 end
 
 function out = ranks_struct(model)
+% Serialize the retained SVD rank of each fitted field.
+
 out = struct();
 for k = 1:numel(model.cores)
     out.(model.cores(k).name) = model.cores(k).rank;
@@ -773,6 +894,9 @@ end
 end
 
 function write_history_csv(path, history)
+% Write an empty file for no accepted steps so downstream scripts can still
+% distinguish "no history" from "run did not finish".
+
 if isempty(history)
     fid = fopen(path, "w");
     fclose(fid);
@@ -783,6 +907,8 @@ writetable(table_history, path);
 end
 
 function write_json(path, value)
+% MATLAB's PrettyPrint option is version-dependent, so fall back gracefully.
+
 try
     text = jsonencode(value, "PrettyPrint", true);
 catch
@@ -794,6 +920,8 @@ fclose(fid);
 end
 
 function array = append_struct(array, item)
+% Append one struct while supporting the initially empty struct([]) case.
+
 if isempty(array)
     array = item;
 else
@@ -802,6 +930,8 @@ end
 end
 
 function array = append_struct_array(array, items)
+% Append a batch of candidate summaries.
+
 if isempty(items)
     return
 end
@@ -813,21 +943,29 @@ end
 end
 
 function value = rms_all(array)
+% MATLAB helper matching Python's global RMS.
+
 value = sqrt(mean(array .^ 2, "all"));
 end
 
 function res = Fomega(cl, cw, x1, x2Row, omega, zeta, omega_x1, omega_x2, u1, u2, zeta_x1)
+% Steady omega equation residual with theta_x = zeta + x1*zeta_x1.
+
 theta_x = zeta + x1 .* zeta_x1;
 res = -(cl * x1 + u1) .* omega_x1 - (cl * x2Row + u2) .* omega_x2 + cw * omega + theta_x;
 end
 
 function res = Fzeta(cl, cw, x1, x2Row, zeta, zeta_x1, zeta_x2, u1, u2)
+% Steady zeta equation residual after writing theta = x1*zeta.
+
 u1dx1 = zeros(size(u1));
 u1dx1(2:end, :) = u1(2:end, :) ./ x1(2:end);
 res = -(cl * x1 + u1) .* zeta_x1 - (cl * x2Row + u2) .* zeta_x2 + (2 * cw - u1dx1) .* zeta;
 end
 
 function mat = BS6mat(BSmesh, valmesh, ind, parity)
+% Wrapper around the odd/even BS6 interpolation builders with constant weights.
+
 f0 = @(x) 0;
 f1 = @(x) 1;
 Fconst = {f1, f0, f0, f0, f0, f0;
@@ -841,6 +979,8 @@ end
 end
 
 function XYcoe = XYcoef(x1, x2, alpha, Chi20, AG)
+% Build far-field Cartesian coefficient tables for the semi-analytic tail.
+
 sr = (x1 .^ 2 + x2' .^ 2) .^ (1/2);
 sb = atan(x2' ./ x1);
 sr = reshape(sr, [], 1);
@@ -859,6 +999,8 @@ XYcoe = Deri_polar_AGcoe(sr, sb, a, ord, Psi_rad, AG);
 end
 
 function fg = Leibni_prod(f, g, x, k)
+% d_x^k(f*g) by the Leibniz rule, using cell arrays of derivative handles.
+
 fg = zeros(size(x));
 for i = 0:k
     fg = fg + f{i + 1}(x) .* g{k - i + 1}(x) .* nchoosek(k, i);
@@ -866,6 +1008,8 @@ end
 end
 
 function chi = Assemble_chi(chi1, chi2, x, k)
+% Derivative of chi = chi1 + (1 - chi1) * chi2.
+
 chi = chi1(x, k);
 for i = 0:k
     if i == k
@@ -877,6 +1021,8 @@ end
 end
 
 function [Psi_rad, Chi] = Dchi(r, ord, a1, lam1, a2, alpha, Chi20)
+% Construct radial cutoff derivatives and derivatives of r^(2-alpha)*chi(r).
+
 itl = ~isa(r, "double") || ~isa(alpha, "double");
 Chi10 = cell(ord + 1, 1);
 syms x;
@@ -919,6 +1065,8 @@ end
 end
 
 function coe = Deri_polar_AGcoe(r, b, a1, ord, Psi_rad, AG)
+% Cartesian derivative coefficients for A(r)B(beta) on flattened grid points.
+
 if isa(r, "double") == 0 || isa(b, "double") == 0
     itl = 1;
 else
@@ -968,6 +1116,9 @@ end
 end
 
 function Psi1 = Deri_Psi1(n1, n2, g, BS_wg, ord, XYcoe)
+% Assemble derivatives of the semi-analytic stream function from radial
+% coefficients and angular spline derivatives.
+
 ord = min(ord, 6);
 Psi1 = cell(ord + 1, ord + 1);
 dg = cell(ord + 1, 1);
@@ -987,6 +1138,8 @@ end
 end
 
 function D = Cell_2double(F)
+% Convert a rectangular cell array of same-sized arrays into a 4-D double.
+
 [s1, s2] = size(F);
 [s3, s4] = size(F{1, 1});
 D = NaN(s3, s4, s1, s2);
@@ -1000,6 +1153,8 @@ end
 end
 
 function M = New_itl(M0, itl)
+% Preserve interval-arithmetic compatibility in the original MATLAB routines.
+
 if itl
     M = intval(M0);
 else

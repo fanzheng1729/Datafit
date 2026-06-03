@@ -34,6 +34,8 @@ except ImportError as exc:  # pragma: no cover - user-facing dependency message
 
 
 def rms(value: np.ndarray) -> float:
+    """Root-mean-square over all entries, matching MATLAB ``rms(..., "all")``."""
+
     return float(np.sqrt(np.mean(np.abs(value) ** 2)))
 
 
@@ -67,10 +69,14 @@ def load_numeric_data(path: Path) -> dict[str, Any]:
 
 
 def meshext(x: np.ndarray, count: int, rate: float) -> np.ndarray:
+    """Geometrically extend the far end of a spline mesh."""
+
     return x[-1] * rate ** np.arange(1, count + 1, dtype=float)
 
 
 def bscoe(order: int, rows: int | None = None) -> np.ndarray:
+    """Return the far-boundary extrapolation coefficients from BS/BScoe.m."""
+
     if rows is None:
         rows = order // 2 - 1
     out = np.empty((rows, order), dtype=float)
@@ -101,11 +107,16 @@ def bs6n(
     if degree != s.size - 1:
         raise ValueError("B-spline support size does not match its degree")
 
+    # BS6N evaluates one compactly supported polynomial piece at a time. The
+    # two formulas below reproduce the MATLAB switch between the small-side and
+    # large-side expressions so that cancellation stays comparable.
     diff = s[None, :] - z[:, None]
     in_support = (z > s[0]) & (z < s[-1])
     use_large_formula = (z > s[degree // 2]) & (z < s[-1])
     use_small_formula = in_support.astype(float) - use_large_formula.astype(float)
 
+    # Each knot contributes a Lagrange-like denominator product. Setting the
+    # self-factor to one mirrors MATLAB's deletion of that term.
     denom = np.empty_like(s)
     for index in range(degree + 1):
         factors = s[index] - s
@@ -116,6 +127,9 @@ def bs6n(
         np.sign(np.maximum(diff, 0.0)) - use_small_formula[:, None]
     ) * in_support[:, None]
 
+    # Near the origin and near the far extrapolated tail, the basis is scaled
+    # by the corresponding mesh spacing. Interior splines use a local midpoint
+    # spacing derived from the support itself.
     if near_id <= 8:
         scale = near_h
     elif far_id <= 8:
@@ -126,6 +140,8 @@ def bs6n(
 
     derivs = np.empty((deriv_count, z.size), dtype=float)
     for deriv in range(deriv_count):
+        # Derivatives are encoded as factorial factors multiplying lower powers
+        # of the knot differences, as in the original vectorized MATLAB code.
         raw = np.sum(
             signs * diff ** (degree - 1 - deriv) / denom[None, :] * (-1) ** deriv,
             axis=1,
@@ -136,10 +152,14 @@ def bs6n(
 
 
 def support_indices(values: np.ndarray, low: float, high: float) -> np.ndarray:
+    """Indices of grid values strictly inside a spline support interval."""
+
     return np.flatnonzero((values - low) * (values - high) < 0.0)
 
 
 def extended_knots(mesh: np.ndarray, rate: float, order: int) -> np.ndarray:
+    """Build the reflected-near-origin and extrapolated-far-end knot vector."""
+
     return np.concatenate(
         (
             np.array([-mesh[3], -mesh[2], -mesh[1]], dtype=float),
@@ -166,6 +186,8 @@ def x_bs6_matrices(
     basis_count = n - 1 if odd else n
     mats = np.zeros((deriv_count, values.size, basis_count), dtype=float)
 
+    # Odd fields omit the constant-at-origin column. Even fields keep it and
+    # double the zero-centered contribution below.
     first_basis = 1 if odd else 0
     for basis in range(first_basis, n):
         knots = xx[basis : basis + order]
@@ -176,6 +198,9 @@ def x_bs6_matrices(
 
         z = values[row_ids]
         vals = bs6n(z, knots, degree, basis - 1, n - basis - 1, h, far_h, deriv_count)
+        # The first few splines overlap the reflected negative mesh. Odd and
+        # even parity differ only in whether that reflected copy subtracts or
+        # adds to the positive-side basis.
         if odd and basis <= order // 2 - 1:
             vals -= bs6n(
                 z, -knots, degree, basis - 1, n - basis - 1, h, far_h, deriv_count
@@ -190,6 +215,8 @@ def x_bs6_matrices(
         col = basis - 1 if odd else basis
         mats[:, row_ids, col] += vals
 
+    # The last physical splines are represented through two extrapolated tail
+    # supports and the BScoe closure coefficients.
     row_ids = support_indices(values, mesh[n - 5], xx[-1])
     if row_ids.size:
         z = values[row_ids]
@@ -203,6 +230,8 @@ def x_bs6_matrices(
             col = basis - 1 if odd else basis
             mats[:, row_ids, col] += vals
 
+    # If the evaluation grid includes the origin, handle that row explicitly
+    # because the strict support test above excludes knot endpoints.
     if values[0] == 0.0:
         if odd:
             for basis in range(1, order // 2):
@@ -257,6 +286,8 @@ def y_bs6_matrices(mesh: np.ndarray, values: np.ndarray, deriv_count: int) -> li
         )
         mats[:, row_ids, basis] += vals
 
+    # The y mesh has no parity switch, but the negative-side closure still
+    # contributes to points near the left boundary.
     left1 = -xx[1:8]
     left2 = -xx[2:9]
     row_ids = support_indices(values, min(left1.min(), left2.min()), max(left1.max(), left2.max()))
@@ -268,6 +299,7 @@ def y_bs6_matrices(mesh: np.ndarray, values: np.ndarray, deriv_count: int) -> li
             vals = a1 * coeff[1, basis] + a2 * coeff[0, basis]
             mats[:, row_ids, basis] += vals
 
+    # Match the far-tail closure used in the x direction.
     row_ids = support_indices(values, mesh[n - 5], xx[-1])
     if row_ids.size:
         z = values[row_ids]
@@ -286,6 +318,8 @@ def y_bs6_matrices(mesh: np.ndarray, values: np.ndarray, deriv_count: int) -> li
 def bs6mat(
     support_mesh: np.ndarray, value_mesh: np.ndarray, deriv_count: int, parity: int
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Return x/y spline evaluation matrices for values and derivatives."""
+
     return (
         x_bs6_matrices(support_mesh, value_mesh, deriv_count, parity),
         y_bs6_matrices(support_mesh, value_mesh, deriv_count),
@@ -293,6 +327,8 @@ def bs6mat(
 
 
 def svd_order(u: np.ndarray, singular_values: np.ndarray, v: np.ndarray, eps: float) -> int:
+    """Choose the first rank whose RMS-scaled singular contribution is tiny."""
+
     for index, sigma in enumerate(singular_values):
         contribution = rms(u[:, index]) * sigma * rms(v[:, index])
         if contribution <= eps:
@@ -307,10 +343,14 @@ def uv_remesh(
     new_mesh: np.ndarray,
     parity: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Project SVD factors from one spline mesh to another and back."""
+
     coarse_x, coarse_y = bs6mat(old_mesh, new_mesh, 1, parity)
     ufit = coarse_x[0] @ ucoef
     vfit = coarse_y[0] @ vcoef
 
+    # Solve coefficients on the candidate mesh, then re-evaluate on the old
+    # grid so the error test compares like with like.
     remesh_x, remesh_y = bs6mat(new_mesh, new_mesh, 1, parity)
     if parity == 1:
         ucoef = np.linalg.solve(remesh_x[0][1:], ufit[1:])
@@ -330,6 +370,8 @@ def uv_remesh(
 def svd_fit(
     field: np.ndarray, x1: np.ndarray, x2: np.ndarray, eps_svd: float, eps_fit: float, parity: int = 1
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit a grid field by low-rank SVD factors represented in BS6 bases."""
+
     u, singular_values, vh = np.linalg.svd(field, full_matrices=True)
     v = vh.T
     keep = svd_order(u, singular_values, v, eps_svd)
@@ -344,6 +386,9 @@ def svd_fit(
     dufit = np.zeros_like(u)
     dvfit = np.zeros_like(v)
 
+    # Start with an exact coefficient solve on the full mesh. The loop below
+    # then tries coarser x meshes and keeps each singular vector's coarsest
+    # acceptable representation independently.
     basis_x, basis_y = bs6mat(x1, x2, 1, parity)
     if parity == 1:
         ucoef = np.linalg.solve(basis_x[0][1:], u[1:])
@@ -352,6 +397,8 @@ def svd_fit(
     vcoef = np.linalg.solve(basis_y[0], v)
 
     for step in range(1, 11):
+        # The first 480 x-nodes are coarsened by the step; the outer tail is
+        # retained because far-field decay and closure are most sensitive there.
         mesh_ids = np.concatenate((np.arange(0, 480, step), np.arange(480, 720)))
         mesh = x1[mesh_ids]
         umesh, vmesh, dumesh, dvmesh = uv_remesh(ucoef, vcoef, x1, mesh, parity)
@@ -376,6 +423,8 @@ def svd_fit(
 def fit_profile_scaled(
     field: np.ndarray, x1: np.ndarray, x2: np.ndarray, eps_svd: float, eps_fit: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit omega/zeta after removing the radial profile factor used in Numerics."""
+
     x1_col = x1[:, None]
     x2_row = x2[None, :]
     factor = np.sqrt(1.0 + x1_col**2) / np.sqrt(1.0 + x1_col**2 + x2_row**2)
@@ -398,6 +447,8 @@ def fit_profile_scaled(
 def fit_u1_damped(
     u1: np.ndarray, x1: np.ndarray, x2: np.ndarray, eps_svd: float, eps_fit: float, power: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit the finite part of u1 after x1 damping improves low-rank decay."""
+
     factor0 = 1.0 + x1[:, None] ** 2
     factor = factor0 ** (power / 2.0)
     fit, fit_x1, fit_x2 = svd_fit(u1 / factor, x1, x2, eps_svd, eps_fit)
@@ -413,6 +464,8 @@ def fit_u1_damped(
 def fit_u2_damped(
     u2: np.ndarray, x1: np.ndarray, x2: np.ndarray, eps_svd: float, eps_fit: float, power: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit the finite part of u2 after x2 damping, using even x1 parity."""
+
     factor0 = 1.0 + x2[None, :] ** 2
     factor = factor0 ** (power / 2.0)
     fit, fit_x1, fit_x2 = svd_fit(u2 / factor, x1, x2, eps_svd, eps_fit, parity=0)
@@ -437,6 +490,8 @@ class Jet:
 
     @classmethod
     def constant(cls, value: np.ndarray | float, order: int, template: np.ndarray) -> "Jet":
+        """Broadcast a scalar/vector value into a constant Taylor jet."""
+
         coeff = np.zeros((order + 1, template.size), dtype=float)
         coeff[0] = value
         return cls(coeff)
@@ -453,6 +508,8 @@ class Jet:
     def __mul__(self, other: "Jet" | float) -> "Jet":
         if np.isscalar(other):
             return Jet(self.coeff * float(other))
+        # Cauchy product for Taylor coefficients; coefficients are normalized
+        # by factorial, so no binomial factors appear here.
         out = np.zeros_like(self.coeff)
         for degree in range(self.order + 1):
             for left_degree in range(degree + 1):
@@ -474,6 +531,8 @@ class Jet:
 
 
 def trig_jet(beta: np.ndarray, order: int, kind: str) -> Jet:
+    """Taylor jet for sin(beta+t) or cos(beta+t)."""
+
     coeff = np.empty((order + 1, beta.size), dtype=float)
     sin_beta = np.sin(beta)
     cos_beta = np.cos(beta)
@@ -531,6 +590,8 @@ def polynomial_derivative_coeffs(deriv: int) -> np.ndarray:
     coeff = np.zeros(8, dtype=float)
     coeff[7] = 1.0
     for current in range(deriv):
+        # Differentiate P*(1+t^2)^(-p) while keeping a single polynomial
+        # numerator and updating p by one at each derivative.
         diff = np.arange(1, coeff.size, dtype=float) * coeff[1:]
         one_plus_t2_diff = np.zeros(diff.size + 2, dtype=float)
         one_plus_t2_diff[: diff.size] += diff
@@ -543,6 +604,8 @@ def polynomial_derivative_coeffs(deriv: int) -> np.ndarray:
 
 
 def chi10_derivative(x: np.ndarray, deriv: int) -> np.ndarray:
+    """Derivative of the algebraic cutoff branch, zeroed for x < 0."""
+
     out = np.zeros_like(x, dtype=float)
     mask = x >= 0.0
     z = x[mask]
@@ -552,6 +615,8 @@ def chi10_derivative(x: np.ndarray, deriv: int) -> np.ndarray:
 
 
 def reciprocal_series(coeff: np.ndarray) -> np.ndarray:
+    """Taylor coefficients of 1 / f from coefficients of f."""
+
     out = np.zeros_like(coeff)
     out[0] = 1.0 / coeff[0]
     for degree in range(1, coeff.shape[0]):
@@ -562,6 +627,8 @@ def reciprocal_series(coeff: np.ndarray) -> np.ndarray:
 
 
 def exp_series(coeff: np.ndarray) -> np.ndarray:
+    """Taylor coefficients of exp(f) from coefficients of f."""
+
     out = np.zeros_like(coeff)
     out[0] = np.exp(coeff[0])
     for degree in range(1, coeff.shape[0]):
@@ -572,6 +639,8 @@ def exp_series(coeff: np.ndarray) -> np.ndarray:
 
 
 def chi0_raw_derivative(x: np.ndarray, deriv: int) -> np.ndarray:
+    """Derivative of the smooth logistic-style cutoff core on (0, 1)."""
+
     p = np.empty((deriv + 1, x.size), dtype=float)
     for degree in range(deriv + 1):
         p[degree] = (-1) ** degree * (x ** (-degree - 1) + (x - 1.0) ** (-degree - 1))
@@ -603,6 +672,8 @@ def chi20_derivative(x: np.ndarray, deriv: int) -> np.ndarray:
 def chi_derivatives(
     radius: np.ndarray, max_deriv: int, a1: float, lam1: float, a2: float
 ) -> list[np.ndarray]:
+    """Assemble derivatives of chi = chi1 + (1 - chi1) * chi2."""
+
     scaled1 = (radius - a1) / math.sqrt(lam1)
     scaled2 = (radius - a2) / (9.0 * a2)
     chi1 = [
@@ -616,6 +687,8 @@ def chi_derivatives(
 
     assembled: list[np.ndarray] = []
     for deriv in range(max_deriv + 1):
+        # Product-rule expansion of chi2 * (1 - chi1) plus the direct chi1
+        # contribution, matching Assemble_chi in the MATLAB script.
         value = chi1[deriv].copy()
         for split in range(deriv + 1):
             remainder = deriv - split
@@ -629,6 +702,8 @@ def chi_derivatives(
 
 
 def psi_radial_derivatives(radius: np.ndarray, alpha: float, max_deriv: int) -> list[np.ndarray]:
+    """Derivatives of the far-field radial profile r^(2-alpha) * chi(r)."""
+
     chi = chi_derivatives(radius, max_deriv, a1=10.0, lam1=50000.0, a2=100000.0)
     # Polar coefficients only consume radii above the cutoff r > 10. Avoid a
     # removable r = 0 negative-power warning while building the full grid array.
@@ -642,6 +717,7 @@ def psi_radial_derivatives(radius: np.ndarray, alpha: float, max_deriv: int) -> 
 
     product_derivs: list[np.ndarray] = []
     for deriv in range(max_deriv + 1):
+        # Leibniz rule for the product of the cutoff and power-law tail.
         value = np.zeros_like(radius, dtype=float)
         for split in range(deriv + 1):
             value += math.comb(deriv, split) * chi[split] * powers[deriv - split]
@@ -652,6 +728,8 @@ def psi_radial_derivatives(radius: np.ndarray, alpha: float, max_deriv: int) -> 
 def deri_polar_agcoe(
     radius: np.ndarray, beta: np.ndarray, radial_derivs: list[np.ndarray], order: int, cutoff: float
 ) -> dict[tuple[int, int, int], np.ndarray]:
+    """Cartesian derivative coefficients for A(r)B(beta) on the grid."""
+
     selected = radius > cutoff
     ag = ag_jets(beta[selected], order)
     coe: dict[tuple[int, int, int], np.ndarray] = {}
@@ -662,6 +740,8 @@ def deri_polar_agcoe(
                 value = np.zeros_like(radius, dtype=float)
                 selected_value = np.zeros(np.count_nonzero(selected), dtype=float)
                 for k in range(degree - ell + 1):
+                    # Appendix C.3 coefficient: angular recurrence term times
+                    # the kth radial derivative divided by r^(degree-k).
                     selected_value += (
                         ag[(i, j, k, ell)].value
                         * radial_derivs[k][selected]
@@ -673,6 +753,8 @@ def deri_polar_agcoe(
 
 
 def xycoef(x1: np.ndarray, x2: np.ndarray, alpha: float, order: int) -> dict[tuple[int, int, int], np.ndarray]:
+    """Construct the far-field coefficient table used by ``deri_psi1``."""
+
     with np.errstate(divide="ignore", invalid="ignore"):
         radius_grid = np.sqrt(x1[:, None] ** 2 + x2[None, :] ** 2)
         beta_grid = np.arctan(x2[None, :] / x1[:, None])
@@ -698,6 +780,8 @@ def deri_psi1(
     polar_coeff: dict[tuple[int, int, int], np.ndarray],
     order: int,
 ) -> dict[tuple[int, int], np.ndarray]:
+    """Evaluate derivatives of the semi-analytic stream-function tail."""
+
     angle_derivs = [
         (bs_wg[deriv] @ angular_coeff) * (-1) ** deriv for deriv in range(order + 1)
     ]
@@ -707,6 +791,8 @@ def deri_psi1(
             j = degree - i
             value = np.zeros(n1 * n2, dtype=float)
             for ell in range(degree + 1):
+                # Combine the precomputed radial/cartesian coefficient with
+                # the angular spline derivative of the same order.
                 value += polar_coeff[(i, j, ell)] * angle_derivs[ell]
             psi[(i, j)] = value.reshape((n1, n2), order="F")
     return psi
@@ -725,6 +811,8 @@ def omega_residual(
     u2: np.ndarray,
     zeta_x1: np.ndarray,
 ) -> np.ndarray:
+    """Steady omega equation residual with theta_x = zeta + x1*zeta_x1."""
+
     theta_x = zeta + x1[:, None] * zeta_x1
     return (
         -(cl * x1[:, None] + u1) * omega_x1
@@ -745,6 +833,8 @@ def zeta_residual(
     u1: np.ndarray,
     u2: np.ndarray,
 ) -> np.ndarray:
+    """Steady zeta equation residual after dividing theta by x1."""
+
     u1dx1 = np.zeros_like(u1)
     u1dx1[1:] = u1[1:] / x1[1:, None]
     return (
@@ -755,6 +845,8 @@ def zeta_residual(
 
 
 def run(data_path: Path) -> dict[str, np.ndarray | float]:
+    """Run the full fit-and-residual diagnostic against a data.mat file."""
+
     data = load_numeric_data(data_path)
     x1 = np.asarray(data["x1"], dtype=float)
     x2 = np.asarray(data["x2"], dtype=float)
@@ -766,6 +858,8 @@ def run(data_path: Path) -> dict[str, np.ndarray | float]:
     zeta_x2 = np.asarray(data["vx2"], dtype=float)
     vel = data["Vel"]
 
+    # First reproduce the profile fits and derivative checks for omega and
+    # zeta. These are the dependent variables in the PDE residuals.
     omegafit, omegafit_x1, omegafit_x2 = fit_profile_scaled(
         omega, x1, x2, 1.0e-10, 1.0e-10
     )
@@ -779,6 +873,8 @@ def run(data_path: Path) -> dict[str, np.ndarray | float]:
         (rms(zeta - zetafit), rms(zeta_x1 - zetafit_x1), rms(zeta_x2 - zetafit_x2))
     )
 
+    # The velocity is split into fitted finite components plus a fixed
+    # semi-analytic far-field stream-function correction.
     u1 = np.asarray(vel["u1"], dtype=float)
     u2 = np.asarray(vel["u2"], dtype=float)
     u10f = np.asarray(vel["u10f"], dtype=float)
@@ -804,6 +900,8 @@ def run(data_path: Path) -> dict[str, np.ndarray | float]:
 
     n1 = x1.size
     n2 = x2.size
+    # Convert psi derivatives into velocity derivatives:
+    # u1 = -psi_x2 and u2 = psi_x1 for the far-field correction.
     u1fit = u10ffit - rat * psi1[(0, 1)][:n1, :n2]
     u1x1 = u10fx1 - rat * psi1[(1, 1)][:n1, :n2]
     u1x2 = u10fx2 - rat * psi1[(0, 2)][:n1, :n2]
@@ -811,6 +909,8 @@ def run(data_path: Path) -> dict[str, np.ndarray | float]:
     u2x1 = u20fx1 + rat * psi1[(2, 0)][:n1, :n2]
     u2x2 = u20fx2 + rat * psi1[(1, 1)][:n1, :n2]
 
+    # The rates are fixed by the origin gauge conditions used in the original
+    # dynamic-rescaling formulation.
     cl = float(4.0 * zeta_x1[0, 0] / omega_x1[0, 0])
     cw = float(vel["u1dx1"][0, 0] + cl / 2.0)
     fomega_original = omega_residual(
@@ -849,6 +949,8 @@ def run(data_path: Path) -> dict[str, np.ndarray | float]:
 
 
 def print_results(result: dict[str, np.ndarray | float]) -> None:
+    """Print the diagnostic values in the same order as the MATLAB script."""
+
     np.set_printoptions(precision=10, suppress=False)
     print("omega fit RMS checks: ", result["omega_checks"])
     print("zeta fit RMS checks:  ", result["zeta_checks"])

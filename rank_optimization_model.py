@@ -29,7 +29,14 @@ from rank_factor_tools import (
 )
 
 
+# ``data.mat`` is the single source of fitted profile data.  Keeping the path
+# relative to this file lets every command-line entry point run from any cwd.
 DATA_PATH = Path(__file__).with_name("data.mat")
+
+# The pushed row-band result uses this conservative low constraint weight.  The
+# value came from the P/Q gradient-balance sweep: it is small enough for the
+# fitted equations to move, but still kept divergence and curl nonincreasing in
+# the recorded 30-step run.
 CONSTRAINT_WEIGHT = 3.0e-4
 
 
@@ -38,6 +45,14 @@ VariableDict = dict[str, np.ndarray | float]
 
 @dataclass
 class RankCore:
+    """Static B-spline/SVD data for one optimized field.
+
+    Each physical field is represented as ``x_factor * (P S Q.T)`` plus, for
+    velocity, a fixed far-field contribution.  ``x0/x1`` and ``y0/y1`` are the
+    value and first-derivative B-spline matrices used to evaluate the current
+    coefficient variables and to pull adjoints back to coefficient space.
+    """
+
     name: str
     parity: int
     x0: np.ndarray
@@ -64,6 +79,8 @@ class RankCore:
 
 @dataclass
 class Evaluation:
+    """One full model evaluation cached at both field and residual levels."""
+
     objective: float
     fields: dict[str, np.ndarray]
     residuals: dict[str, np.ndarray]
@@ -80,6 +97,8 @@ def relative_norm(error: np.ndarray, reference: np.ndarray) -> float:
 
 
 def copy_variables(variables: VariableDict) -> VariableDict:
+    """Deep-copy the mixed array/scalar variable dictionary."""
+
     out: VariableDict = {}
     for key, value in variables.items():
         out[key] = value.copy() if isinstance(value, np.ndarray) else float(value)
@@ -87,6 +106,8 @@ def copy_variables(variables: VariableDict) -> VariableDict:
 
 
 def variable_dot(left: VariableDict, right: VariableDict) -> float:
+    """Euclidean dot product in the current coefficient/scalar coordinates."""
+
     total = 0.0
     for key, left_value in left.items():
         right_value = right[key]
@@ -103,6 +124,8 @@ def variable_norm(variables: VariableDict) -> float:
 
 
 def add_scaled_variables(base: VariableDict, direction: VariableDict, scale: float) -> VariableDict:
+    """Return ``base + scale * direction`` without mutating scalar entries."""
+
     out = copy_variables(base)
     for key, value in out.items():
         direction_value = direction[key]
@@ -122,7 +145,13 @@ def build_rank_core(
     parity: int,
     eps_svd: float,
 ) -> RankCore:
-    """Build explicit-S B-spline coefficients for a fitted core."""
+    """Build explicit-S B-spline coefficients for a fitted core.
+
+    The saved profile stores evaluated fields on the mesh.  The optimizer
+    works in B-spline coefficient space, so initialization first performs an
+    SVD of the mesh field and then solves for B-spline coefficients that
+    reproduce the left and right singular vectors.
+    """
 
     u, singular_values, vh = np.linalg.svd(core, full_matrices=False)
     v = vh.T
@@ -131,6 +160,9 @@ def build_rank_core(
     v = v[:, :rank]
     singular_values = singular_values[:rank]
     if parity == 1:
+        # Odd-reflected fields vanish at x1=0.  Dropping the origin row mirrors
+        # the MATLAB fitting convention and prevents the coefficient solve from
+        # fighting an enforced zero boundary value.
         u[0, :] = 0.0
 
     basis_x, basis_y = runfit.bs6mat(x1, x2, 2, parity)
@@ -155,7 +187,14 @@ def build_rank_core(
 
 
 class RankOptimizationModel:
-    """Objective, gradients, gauges, and retraction for explicit-S variables."""
+    """Objective, gradients, gauges, and retraction for explicit-S variables.
+
+    This class owns the mathematical contract used by every optimizer script:
+    a variable dictionary is converted to physical fields, the four residual
+    equations are evaluated on the grid, and analytic adjoints are pushed back
+    to the low-rank B-spline coefficients.  Keeping this in one place makes the
+    vanilla, row-band, and diagnostic scripts comparable.
+    """
 
     def __init__(
         self,
@@ -166,6 +205,10 @@ class RankOptimizationModel:
         if constraint_weight <= 0.0:
             raise ValueError("constraint_weight must be positive")
         self.constraint_weight = float(constraint_weight)
+
+        # Load only numerical data from the MAT file.  The MATLAB file contains
+        # function handles too, but ``runfit.load_numeric_data`` deliberately
+        # avoids requiring MATLAB to deserialize them.
         data = runfit.load_numeric_data(data_path)
         self.x1 = np.asarray(data["x1"], dtype=float)
         self.x2 = np.asarray(data["x2"], dtype=float)
@@ -179,6 +222,9 @@ class RankOptimizationModel:
         u10f = np.asarray(vel["u10f"], dtype=float)
         u20f = np.asarray(vel["u20f"], dtype=float)
 
+        # The rank factors are fitted to rescaled cores, not directly to the
+        # physical fields.  These analytic weights restore the physical
+        # profiles and provide their product-rule derivatives.
         self.profile_factor = np.sqrt(1.0 + self.x1_col**2) / np.sqrt(
             1.0 + self.x1_col**2 + self.x2_row**2
         )
@@ -192,6 +238,9 @@ class RankOptimizationModel:
             -self.x2_row / (1.0 + self.x1_col**2 + self.x2_row**2)
         )
 
+        # The near-field velocity factors use one-dimensional damping weights.
+        # The far-field velocity is not optimized; it is reconstructed once in
+        # ``_build_fixed_velocity`` and then added to every evaluation.
         factor0_u1 = 1.0 + self.x1_col**2
         self.u1_factor = factor0_u1**0.25
         self.u1_factor_x1 = 0.5 * self.x1_col * self.u1_factor / factor0_u1
@@ -199,6 +248,8 @@ class RankOptimizationModel:
         self.u2_factor = factor0_u2**0.25
         self.u2_factor_x2 = 0.5 * self.x2_row * self.u2_factor / factor0_u2
 
+        # The SVD cutoffs follow the older fitting scripts: omega/zeta are
+        # slightly less strict than the two velocity components.
         self.cores = [
             build_rank_core("omega", omega / self.profile_factor, self.x1, self.x2, 1, 1.0e-10),
             build_rank_core("zeta", zeta / self.profile_factor, self.x1, self.x2, 1, 1.0e-10),
@@ -210,6 +261,8 @@ class RankOptimizationModel:
         self.fixed_velocity = self._build_fixed_velocity(data)
         omega_x1 = np.asarray(data["wx1"], dtype=float)
         zeta_x1 = np.asarray(data["vx1"], dtype=float)
+        # The two scalar rates are initialized from the origin identities used
+        # in the original dynamic-rescaling formulation.
         cl = float(4.0 * zeta_x1[0, 0] / omega_x1[0, 0])
         cw = float(vel["u1dx1"][0, 0] + cl / 2.0)
 
@@ -221,6 +274,8 @@ class RankOptimizationModel:
         if normalize_initial:
             self.variables = self.retract_variables(self.variables, force=True)
 
+        # Gauges and residual scales are frozen at the normalized initial chart.
+        # The objective then measures relative movement from that baseline.
         base = self.evaluate(self.variables)
         self.gauge_targets = self.gauge_values_from_fields(base.fields)
         self.scales = {name: max(rms(value), np.finfo(float).tiny) for name, value in base.residuals.items()}
@@ -235,6 +290,14 @@ class RankOptimizationModel:
         return self.array_keys() + ["cl", "cw"]
 
     def _build_fixed_velocity(self, data: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Reconstruct the non-optimized far-field velocity contribution.
+
+        The optimized ``u1``/``u2`` cores cover only the near-field pieces.  The
+        saved streamfunction correction ``Psi1`` contributes a fixed velocity
+        tail and its derivatives, which must be present for the curl and
+        divergence residuals to match the saved MATLAB fit.
+        """
+
         rat = float(np.asarray(data["rec"])[6])
         polar_coeff = runfit.xycoef(
             np.asarray(data["gx1"], dtype=float),
@@ -262,6 +325,8 @@ class RankOptimizationModel:
         }
 
     def _core_eval(self, core: RankCore, variables: VariableDict) -> dict[str, np.ndarray]:
+        """Evaluate one core and its first derivatives on the tensor grid."""
+
         p = variables[core.p_key]
         q = variables[core.q_key]
         s = variables[core.s_key]
@@ -285,12 +350,17 @@ class RankOptimizationModel:
         }
 
     def evaluate(self, variables: VariableDict) -> Evaluation:
+        """Evaluate physical fields, residual equations, and cached core data."""
+
         core_cache = {core.name: self._core_eval(core, variables) for core in self.cores}
         omega_core = core_cache["omega"]
         zeta_core = core_cache["zeta"]
         u1_core = core_cache["u1"]
         u2_core = core_cache["u2"]
 
+        # Product-rule restoration from rescaled rank cores to physical fields.
+        # The rank core derivatives are derivatives of the fitted core; the
+        # analytic factors contribute the remaining derivative terms.
         omega = self.profile_factor * omega_core["value"]
         omega_x1 = self.profile_factor * omega_core["x1"] + self.profile_factor_x1 * omega_core["value"]
         omega_x2 = self.profile_factor * omega_core["x2"] + self.profile_factor_x2 * omega_core["value"]
@@ -298,6 +368,8 @@ class RankOptimizationModel:
         zeta_x1 = self.profile_factor * zeta_core["x1"] + self.profile_factor_x1 * zeta_core["value"]
         zeta_x2 = self.profile_factor * zeta_core["x2"] + self.profile_factor_x2 * zeta_core["value"]
 
+        # Velocity is split into optimized near-field rank cores and a fixed
+        # far-field streamfunction-derived piece.
         u1 = self.u1_factor * u1_core["value"] + self.fixed_velocity["u1"]
         u1x1 = (
             self.u1_factor * u1_core["x1"]
@@ -315,6 +387,8 @@ class RankOptimizationModel:
 
         cl = float(variables["cl"])
         cw = float(variables["cw"])
+        # The four residuals are the dependent equations solved by the fit:
+        # two profile equations plus incompressibility and curl consistency.
         fomega = runfit.omega_residual(
             cl, cw, self.x1, self.x2, omega, zeta, omega_x1, omega_x2, u1, u2, zeta_x1
         )
@@ -347,6 +421,8 @@ class RankOptimizationModel:
         return Evaluation(objective=objective, fields=fields, residuals=residuals, core_cache=core_cache)
 
     def objective_from_residuals(self, residuals: dict[str, np.ndarray]) -> float:
+        """Return the weighted mean-square objective from residual arrays."""
+
         return float(
             0.5 * np.mean((residuals["fomega"] / self.scales["fomega"]) ** 2)
             + 0.5 * np.mean((residuals["fzeta"] / self.scales["fzeta"]) ** 2)
@@ -364,6 +440,8 @@ class RankOptimizationModel:
         return self.residual_rms_from_residuals(self.evaluate(variables).residuals)
 
     def gauge_values_from_fields(self, fields: dict[str, np.ndarray]) -> dict[str, float]:
+        """Return the two origin gauges kept fixed by tangent projection."""
+
         return {
             "omega_x1_00": float(fields["omega_x1"][0, 0]),
             "theta_x1x1_00": float(2.0 * fields["zeta_x1"][0, 0]),
@@ -380,6 +458,8 @@ class RankOptimizationModel:
         return self.gauge_errors_from_fields(self.evaluate(variables).fields)
 
     def _lambdas(self, residuals: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Residual adjoints for the normalized least-squares objective."""
+
         n = self.n_grid
         return {
             "fomega": residuals["fomega"] / (self.scales["fomega"] ** 2 * n),
@@ -393,6 +473,8 @@ class RankOptimizationModel:
         variables: VariableDict,
         evaluation: Evaluation | None = None,
     ) -> VariableDict:
+        """Return the analytic gradient in coefficient/scalar coordinates."""
+
         field_gradients = self.field_gradient(variables, evaluation=evaluation)
         evaluation = field_gradients["evaluation"]
         fields = evaluation.fields
@@ -401,6 +483,8 @@ class RankOptimizationModel:
         a1 = cl * self.x1_col + fields["u1"]
         a2 = cl * self.x2_row + fields["u2"]
 
+        # ``cl`` and ``cw`` enter only the two profile residuals, so their
+        # gradients are direct contractions of those residual adjoints.
         gradient: VariableDict = {
             "cl": float(
                 np.sum(lam["fomega"] * (-(self.x1_col * fields["omega_x1"] + self.x2_row * fields["omega_x2"])))
@@ -432,7 +516,12 @@ class RankOptimizationModel:
         variables: VariableDict,
         evaluation: Evaluation | None = None,
     ) -> dict[str, Any]:
-        """Return field-level gradients for debugging and independent checks."""
+        """Return adjoints with respect to field values and derivatives.
+
+        Each tuple is ``(dJ/d value, dJ/d x1_derivative, dJ/d x2_derivative)``
+        for the named field before the rank-factor pullback.  Keeping this
+        separately exposed made the gradient-localization diagnostics possible.
+        """
 
         if evaluation is None:
             evaluation = self.evaluate(variables)
@@ -442,6 +531,9 @@ class RankOptimizationModel:
         cw = float(variables["cw"])
         a1 = cl * self.x1_col + fields["u1"]
         a2 = cl * self.x2_row + fields["u2"]
+        # The zeta equation contains ``u1/x1``.  At the symmetry axis the term
+        # is omitted to avoid an artificial division by zero; the first mesh row
+        # is already controlled by the gauge conditions.
         h_adjoint = np.zeros_like(fields["u1"])
         h_adjoint[1:] = (fields["zeta"] * lam["fzeta"])[1:] / self.x1[1:, None]
         return {
@@ -469,6 +561,8 @@ class RankOptimizationModel:
         }
 
     def _u1_over_x1(self, u1: np.ndarray) -> np.ndarray:
+        """Compute ``u1/x1`` with the axis row set to zero."""
+
         out = np.zeros_like(u1)
         out[1:] = u1[1:] / self.x1[1:, None]
         return out
@@ -485,7 +579,12 @@ class RankOptimizationModel:
         factor_x1: np.ndarray,
         factor_x2: np.ndarray,
     ) -> None:
+        """Pull field adjoints back through one low-rank B-spline core."""
+
         core = self.core_by_name[name]
+        # Undo the physical scaling in adjoint form.  A derivative residual can
+        # hit both the rank-core derivative and the derivative of the analytic
+        # profile factor, hence the three core adjoints below.
         g_core = factor * g_value + factor_x1 * g_x1 + factor_x2 * g_x2
         g_core_x1 = factor * g_x1
         g_core_x2 = factor * g_x2
@@ -495,6 +594,8 @@ class RankOptimizationModel:
         right_x2 = cache["right_x2"]
         s = cache["s"]
 
+        # The identities are the matrix-calculus adjoints of
+        # ``left @ diag(s) @ right.T`` and its x1/x2 derivative variants.
         right_s = right * s[None, :]
         right_x2_s = right_x2 * s[None, :]
         left_s = left * s[None, :]
@@ -516,6 +617,8 @@ class RankOptimizationModel:
         )
 
     def gauge_gradients(self, variables: VariableDict) -> dict[str, VariableDict]:
+        """Return coefficient gradients of the two fixed gauge values."""
+
         zero = self.zero_like_variables(variables)
         return {
             "omega_x1_00": self._single_gauge_gradient("omega", variables, scale=1.0, template=zero),
@@ -529,6 +632,8 @@ class RankOptimizationModel:
         scale: float,
         template: VariableDict,
     ) -> VariableDict:
+        """Gradient of one origin derivative gauge for omega or zeta."""
+
         core = self.core_by_name[name]
         cache = self._core_eval(core, variables)
         factor = self.profile_factor[0, 0]
@@ -550,13 +655,21 @@ class RankOptimizationModel:
         return out
 
     def zero_like_variables(self, variables: VariableDict) -> VariableDict:
+        """Return a zero variable dictionary with the same mixed structure."""
+
         out: VariableDict = {}
         for key, value in variables.items():
             out[key] = np.zeros_like(value) if isinstance(value, np.ndarray) else 0.0
         return out
 
     def projected_tangent_direction(self, variables: VariableDict, raw_direction: VariableDict) -> VariableDict:
-        """Project a direction onto the tangent space of the two fixed gauges."""
+        """Project a direction onto the tangent space of the two fixed gauges.
+
+        The optimizer is allowed to change the profile, but it should not drift
+        in the two scalar normalizations inherited from the original fit.  This
+        solves the small normal-equation system for the gauge-gradient
+        correction and subtracts it from the raw direction.
+        """
 
         gauges = self.gauge_gradients(variables)
         names = ["omega_x1_00", "theta_x1x1_00"]
@@ -565,6 +678,8 @@ class RankOptimizationModel:
             dtype=float,
         )
         rhs = np.array([variable_dot(gauges[name], raw_direction) for name in names], dtype=float)
+        # The gauge Gram matrix is 2x2; the pseudo-inverse branch is a guard
+        # against near-collinearity if a future state degenerates.
         if np.linalg.cond(gram) > 1.0e14:
             correction = np.linalg.pinv(gram) @ rhs
         else:
@@ -583,6 +698,8 @@ class RankOptimizationModel:
         return projected
 
     def core_chart_errors(self, core: RankCore, variables: VariableDict) -> dict[str, float]:
+        """Measure violations of the explicit-S chart normalization."""
+
         p = variables[core.p_key]
         q = variables[core.q_key]
         s = variables[core.s_key]
@@ -591,6 +708,8 @@ class RankOptimizationModel:
         assert isinstance(s, np.ndarray)
         left = core.x0 @ p
         right = core.y0 @ q
+        # The retraction convention keeps columns orthonormal, singular values
+        # nonnegative, and singular values sorted from largest to smallest.
         sorted_violation = 0.0
         if s.size > 1:
             sorted_violation = max(0.0, float(np.max(s[1:] - s[:-1])))
@@ -608,10 +727,14 @@ class RankOptimizationModel:
         variables: VariableDict,
         tolerance: float,
     ) -> bool:
+        """Return whether a core is already close enough to retraction form."""
+
         errors = self.core_chart_errors(core, variables)
         return all(value <= tolerance for value in errors.values())
 
     def chart_error_summary(self, variables: VariableDict) -> dict[str, dict[str, float]]:
+        """Return chart-normalization diagnostics for every optimized core."""
+
         return {
             core.name: self.core_chart_errors(core, variables)
             for core in self.cores
@@ -624,6 +747,14 @@ class RankOptimizationModel:
         force: bool = False,
         tolerance: float = 1.0e-10,
     ) -> VariableDict:
+        """Retract all rank cores back to the normalized explicit-S chart.
+
+        Trial steps perturb the coefficient factors directly.  Retraction keeps
+        the represented field nearly unchanged while removing gauge freedom in
+        the low-rank factorization; without it, the same field could be encoded
+        by many badly scaled ``P, Q, s`` triples.
+        """
+
         out = copy_variables(variables)
         for core in self.cores:
             p = out[core.p_key]
@@ -632,6 +763,9 @@ class RankOptimizationModel:
             assert isinstance(p, np.ndarray)
             assert isinstance(q, np.ndarray)
             assert isinstance(s, np.ndarray)
+            # Skipping already-normalized cores avoids unnecessary SVD/refit
+            # noise after small steps, but initialization forces every core
+            # through the chart once.
             if not force and self.core_chart_is_normalized(core, out, tolerance):
                 continue
             left = core.x0 @ p

@@ -21,6 +21,10 @@
 % warning on
 addpath("BS\")
 load data.mat
+
+% Rename the short MAT-file fields into the notation used below. Keeping the
+% aliases explicit helps compare this script with runfit.py and the equations
+% in Analysis.pdf.
 omega = w;
 omega_x1 = wx1;
 omega_x2 = wx2;
@@ -44,6 +48,10 @@ u2 = Vel.u2;
 u10f = Vel.u10f;
 u20f = Vel.u20f;
 rat = rec(7);
+
+% Fit the finite velocity part in a damped representation. The analytic tail
+% from Psi1 is added back afterward so the velocity still includes the far
+% field used by the original solver.
 [u10ffit, u10fx1, u10fx2] = fitu1damped(u10f, x1, x2, 1e-11, 1e-11, 1/2);
 Psi1 = Deri_Psi1(length(gx1), length(gx2), p_ag_coe, BS1d_large, 2, XYcoef(gx1, gx2, alpha_b, Chi20, AG));
 Psi1 = Cell_2double(Psi1);
@@ -58,11 +66,17 @@ u2x1  = u20fx1  + rat * Psi1(1:n1, 1:n2, 3, 1);
 u2x2  = u20fx2  + rat * Psi1(1:n1, 1:n2, 2, 2);
 rms(u1-u1fit,"all")/rms(u1,"all")
 rms(u2-u2fit,"all")/rms(u2,"all")
+
+% These two checks verify that the reconstructed velocity is nearly
+% incompressible and has curl matching the fitted omega.
 rms(u1x1+u2x2,"all")
 % curl(u) = u1_x2 - u2_x1 should reproduce omega.
 rms(u1x2-u2x1-omegafit,"all")
 cl = 4 * zeta_x1(1, 1) / omega_x1(1, 1);
 cw = Vel.u1dx1(1, 1) + cl / 2;
+
+% Compare residuals on the raw data fields and on the fitted low-rank/spline
+% fields. The optimizer modules use the same residual definitions.
 max(abs(Fomega(cl, cw, x1, x2, omega, zeta, omega_x1, omega_x2, u1, u2, zeta_x1)), [], "all")
 max(abs(Fomega(cl, cw, x1, x2, omegafit, zetafit, omegafitx1, omegafitx2, u1fit, u2fit, zetafitx1)), [], "all")
 rms(abs(Fomega(cl, cw, x1, x2, omega, zeta, omega_x1, omega_x2, u1, u2, zeta_x1)), "all")
@@ -73,16 +87,20 @@ rms(abs(Fzeta(cl, cw, x1, x2, zeta, zeta_x1, zeta_x2, u1, u2)), "all")
 rms(abs(Fzeta(cl, cw, x1, x2, zetafit, zetafitx1, zetafitx2, u1fit, u2fit)), "all")
 
 function res = Fomega(cl, cw, x1, x2, omega, zeta, omega_x1, omega_x2, u1, u2, zeta_x1)
+    % Steady omega equation residual with theta_x = zeta + x1*zeta_x1.
     theta_x = zeta + x1 .* zeta_x1;
     res =- (cl * x1 + u1) .* omega_x1 - (cl * x2' + u2) .* omega_x2 + cw * omega + theta_x;
 end
 function res = Fzeta(cl, cw, x1, x2, zeta, zeta_x1, zeta_x2, u1, u2)
+    % Steady zeta equation residual after theta = x1*zeta.
     u1dx1 = zeros(size(u1));
     u1dx1(2:end, :) = u1(2:end, :) ./ x1(2:end);
     res =- (cl * x1 + u1) .* zeta_x1 - (cl * x2' + u2) .* zeta_x2 + (2 * cw - u1dx1) .* zeta;
 end
 
 function [Afit, Afitx1, Afitx2] = fitprofilescaled(A, x1, x2, epsSVD, epsfit)
+    % Remove the known radial profile factor before doing the SVD/B-spline fit.
+    % The product-rule terms below restore derivatives in the physical field.
     factor = sqrt(1 + x1.^2) ./ sqrt(1 + x1.^2 + x2'.^2);
     Ascaled = A ./ factor;
     [Ascaledfit, Ascaledfitx1, Ascaledfitx2] = SVDfit(Ascaled, x1, x2, epsSVD, epsfit);
@@ -92,6 +110,8 @@ function [Afit, Afitx1, Afitx2] = fitprofilescaled(A, x1, x2, epsSVD, epsfit)
 end
 
 function [u1fit, u1x1, u1x2] = fitu1damped(u1, x1, x2, epsSVD, epsfit, power)
+    % Damping improves the low-rank representation of u1. The final derivative
+    % includes the product-rule contribution from the damping factor.
     if nargin < 6, power = 1; end
     factor0= 1 + x1.^2;
     factor = factor0 .^ (power/2);
@@ -104,6 +124,7 @@ function [u1fit, u1x1, u1x2] = fitu1damped(u1, x1, x2, epsSVD, epsfit, power)
     u1x1  = dampedfitx1 .* factor + power * x1 .* factor .* dampedfit ./ factor0;
 end
 function [u2fit, u2x1, u2x2] = fitu2damped(u2, x1, x2, epsSVD, epsfit, power)
+    % u2 is even in x1 and is damped in x2 for the finite velocity fit.
     if nargin < 6, power = 1; end
     factor0= 1 + x2'.^2;
     factor = factor0 .^ (power/2);
@@ -117,6 +138,9 @@ function [u2fit, u2x1, u2x2] = fitu2damped(u2, x1, x2, epsSVD, epsfit, power)
 end
 
 function [Afit, Afitx1, Afitx2, Afitx1x1, Afitx2x2] = SVDfit(A, x1, x2, epsSVD, epsfit, parity)
+    % Low-rank fit of a grid field using SVD factors represented by BS6 bases.
+    % Each singular vector is allowed to use the coarsest x remesh that keeps
+    % its RMS contribution below epsfit.
     odd = 1;
     if nargin < 6, parity = odd; end 
     [U, S, V] = svd(A);
@@ -144,6 +168,8 @@ function [Afit, Afitx1, Afitx2, Afitx1x1, Afitx2x2] = SVDfit(A, x1, x2, epsSVD, 
     Aerr = zeros(size(steps));
     warning off
     for step = steps
+        % Coarsen only the inner 480 x-nodes. The outer tail remains dense
+        % because far-field closure is sensitive there.
         mesh = x1([1:step:480 481:720]);
         if nargout <= 3
             [Umesh, Vmesh, dUmesh, dVmesh] = UVremesh(Ucoef, Vcoef, x1, mesh, parity);
@@ -185,6 +211,7 @@ function [Afit, Afitx1, Afitx2, Afitx1x1, Afitx2x2] = SVDfit(A, x1, x2, epsSVD, 
 end
 
 function N = SVDorder(U, S, V, eps)
+    % Stop once the RMS-scaled rank-one contribution is below eps.
     N = size(S, 1);
     for i=1:N
         if rms(U(:, i)) * S(i,i) * rms(V(:, i)) <= eps
@@ -195,12 +222,15 @@ function N = SVDorder(U, S, V, eps)
 end
 
 function [U, S, V] = SVDtrunc(U, S, V, N)
+    % Keep the leading N singular directions.
     U = U(:, 1:N);
     S = S(1:N,1:N);
     V = V(:, 1:N);
 end
 
 function [Ufit, Vfit, dUfit, dVfit, ddUfit, ddVfit] = UVremesh(Ucoef, Vcoef, oldmesh, newmesh, parity)
+    % Project spline coefficients onto a candidate mesh and evaluate back on
+    % the original mesh for an apples-to-apples error check.
     odd = 1;
     mat2 = BS6mat(oldmesh, newmesh, 1, parity);
     Ufit= mat2{1,1} * Ucoef;
@@ -226,6 +256,7 @@ function [Ufit, Vfit, dUfit, dVfit, ddUfit, ddVfit] = UVremesh(Ucoef, Vcoef, old
 end
 
 function mat = BS6mat(BSmesh, valmesh, ind, parity)
+    % Build value/derivative matrices for odd or even x1 parity.
     f0 = @(x) 0;
     f1 = @(x) 1;
     % For the spline representation of omega and zeta, we do not use weights.
@@ -241,6 +272,8 @@ function mat = BS6mat(BSmesh, valmesh, ind, parity)
 end
 
 function XYcoe = XYcoef(x1, x2, alpha, Chi20, AG)
+    % Precompute radial/cartesian coefficients for the semi-analytic far-field
+    % stream-function correction.
     sr = (x1 .^ 2 + x2' .^ 2) .^ (1/2);
     sb = atan(x2' ./ x1);
     sr = reshape(sr, [], 1);
