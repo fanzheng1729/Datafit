@@ -56,6 +56,9 @@ u1_x2 - u2_x1 = omega
   rank-factor optimizer. It uses the same optimized variables, analytic
   gradient, fixed-gauge projection, line search, and retraction/refit structure
   as the Python optimizer.
+- `optimize_rank_factors_pq_rowband.m`: MATLAB wrapper for the pushed
+  all-variable row-band optimizer setup. It reuses `optimize_rank_factors.m`
+  and defaults to the recorded `constraintWeight = 0.007`, 30-step run.
 - `runfit.py`: Python equivalent of the MATLAB fit/check path. See
   `README_PYTHON.md` for MAT-file loading and implementation details.
 - `data.mat`: saved profile data, grids, velocity data, far-field coefficients,
@@ -122,6 +125,38 @@ matlab_rank_optimization_state.mat
 The MATLAB path uses MATLAB's own SVD/QR and far-field function-handle
 evaluation, so it is expected to be close to, but not bit-for-bit identical
 with, the Python optimizer.
+
+### MATLAB Row-Band Optimizer
+
+The pushed row-band setup has a MATLAB wrapper:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband();"
+```
+
+Pass a leading integer to run a non-default number of iterations while keeping
+the other row-band defaults:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2);"
+```
+
+The wrapper defaults to `Mode = rowband_all`, `ConstraintWeight = 0.007`,
+`MaxIterations = 30`, `NoExtraShrinks = true`, and
+`RowbandUseNaturalStep = true`. It reads the converted MATLAB starting state
+`compare_curl_trust_rank_optimization_state.mat` and the diagnostic
+`all_variable_rowband_step_scaling_diagnostic_results.json`.
+
+Candidate line-search steps can be evaluated with MATLAB `parfor` when
+Parallel Computing Toolbox is installed:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2,'UseParallel',true);"
+```
+
+`UseParallel` defaults to `false`. On the current 7-candidate line search,
+serial evaluation was slightly faster than a warmed 4-worker process pool, so
+parallel mode is mainly an optional experiment for heavier candidate workloads.
 
 ## Run Python
 

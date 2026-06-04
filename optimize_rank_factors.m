@@ -5,6 +5,8 @@ function output = optimize_rank_factors(varargin)
 %   optimize_rank_factors(20)
 %   optimize_rank_factors('MaxIterations', 50)
 %   optimize_rank_factors(2, 'OutputPrefix', 'matlab_smoke_rank_optimization')
+%   optimize_rank_factors('Mode', 'rowband_all', 'StatePath', 'state.mat', ...
+%       'RowbandDiagnostic', 'all_variable_rowband_step_scaling_diagnostic_results.json')
 
 opts = parse_optimizer_options(varargin{:});
 addpath("BS\")
@@ -12,15 +14,29 @@ addpath("BS\")
 fprintf("Monitored explicit-S rank-factor gradient optimization (MATLAB)\n");
 fprintf("  max iterations:           %d\n", opts.maxIterations);
 fprintf("  output prefix:            %s\n", opts.outputPrefix);
+fprintf("  mode:                     %s\n", opts.mode);
+fprintf("  constraint weight:        %.12g\n", opts.constraintWeight);
+fprintf("  parallel candidates:      %d\n", opts.useParallel);
 
-model = build_model();
-variables = copy_variables(model.variables);
+model = build_model(opts.constraintWeight);
+if strlength(opts.statePath) > 0
+    fprintf("  starting state:           %s\n", opts.statePath);
+    variables = load_optimizer_state(opts.statePath, model);
+else
+    variables = copy_variables(model.variables);
+end
+rowband_diagnostic = read_rowband_diagnostic(opts.rowbandDiagnostic, opts.mode);
+target_blocks = target_blocks_for_mode(opts.mode, rowband_diagnostic);
+if mode_needs_diagnostic(opts.mode)
+    fprintf("  row-band diagnostic:      %s\n", opts.rowbandDiagnostic);
+end
 
 % The optimizer always evaluates the objective through the normalized
 % residuals in model.scales. That keeps the four equations comparable even
 % though the physical RMS sizes differ by many orders of magnitude.
 current_evaluation = evaluate_model(model, variables);
 initial_objective = objective_from_residuals(model, current_evaluation.residuals);
+initial_components = objective_components(model, current_evaluation.residuals);
 initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 initial_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 step_scale = opts.initialStepScale;
@@ -31,8 +47,9 @@ paths = output_paths(opts.outputPrefix);
 
 for iteration = 1:opts.maxIterations
     base_objective = objective_from_residuals(model, current_evaluation.residuals);
+    base_components = objective_components(model, current_evaluation.residuals);
     gradient = analytic_gradient(model, variables, current_evaluation);
-    raw_direction = scale_variables(gradient, -1.0, model.variableKeys);
+    raw_direction = raw_direction_for_mode(opts.mode, variables, gradient, rowband_diagnostic, target_blocks, model);
 
     % Project the raw negative gradient into the tangent space of the origin
     % gauges before trying any step. This keeps c_l and c_omega tied to the
@@ -47,20 +64,40 @@ for iteration = 1:opts.maxIterations
         break
     end
 
-    steps = step_scale * opts.stepMultipliers;
-    candidates = struct([]);
+    search_step_scale = step_scale;
+    if is_rowband_mode(opts.mode) && opts.rowbandUseNaturalStep
+        % Row-band directions already carry the measured safe group magnitudes.
+        % The line search therefore starts from that natural norm, as in the
+        % pushed Python comparison, instead of the tiny vanilla gradient scale.
+        search_step_scale = projected_gradient_norm;
+    end
+
+    steps = line_search_steps(opts, search_step_scale);
+    candidate_summaries = cell(numel(steps), 1);
     candidate_variables = cell(numel(steps), 1);
     candidate_evaluations = cell(numel(steps), 1);
-    for k = 1:numel(steps)
-        % Each trial is retracted after stepping so P/Q/S return to the
-        % orthonormal chart before the objective and gauge checks are made.
-        [summary, candidate, candidate_evaluation] = candidate_summary( ...
-            model, variables, direction, steps(k), base_objective, opts);
-        summary.iteration = iteration;
-        candidates = append_struct(candidates, summary);
-        candidate_variables{k} = candidate;
-        candidate_evaluations{k} = candidate_evaluation;
+    if opts.useParallel
+        parfor k = 1:numel(steps)
+            % Each trial is retracted after stepping so P/Q/S return to the
+            % orthonormal chart before the objective and gauge checks are made.
+            [summary, candidate, candidate_evaluation] = candidate_summary( ...
+                model, variables, direction, steps(k), base_objective, base_components, opts);
+            summary.iteration = iteration;
+            candidate_summaries{k} = summary;
+            candidate_variables{k} = candidate;
+            candidate_evaluations{k} = candidate_evaluation;
+        end
+    else
+        for k = 1:numel(steps)
+            [summary, candidate, candidate_evaluation] = candidate_summary( ...
+                model, variables, direction, steps(k), base_objective, base_components, opts);
+            summary.iteration = iteration;
+            candidate_summaries{k} = summary;
+            candidate_variables{k} = candidate;
+            candidate_evaluations{k} = candidate_evaluation;
+        end
     end
+    candidates = [candidate_summaries{:}];
     candidate_history = append_struct_array(candidate_history, candidates);
 
     accepted = find([candidates.accepted]);
@@ -77,16 +114,17 @@ for iteration = 1:opts.maxIterations
     step_scale = best.step;
     residuals = residual_rms_from_residuals(current_evaluation.residuals);
     gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
+    components = best.objective_components;
 
     row = history_row( ...
         iteration, best.objective, best.objective_change, best.step, ...
         gradient_norm, projected_gradient_norm, directional_derivative, ...
-        gauge_errors, residuals);
+        gauge_errors, residuals, opts.mode, search_step_scale, components);
     history = append_struct(history, row);
 
-    fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e |g_T|=%.3e curl=%.3e gauge=%.3e\n", ...
+    fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e |d_raw|=%.3e div_loss=%.3e curl_loss=%.3e gauge=%.3e\n", ...
         iteration, opts.maxIterations, best.objective, best.objective_change, ...
-        best.step, projected_gradient_norm, residuals.curl, max_abs_struct(gauge_errors));
+        best.step, projected_gradient_norm, components.divergence, components.curl, max_abs_struct(gauge_errors));
 
     if abs(best.objective_change) < opts.minObjectiveDecrease
         stop_reason = "accepted decrease fell below the minimum improvement";
@@ -95,6 +133,7 @@ for iteration = 1:opts.maxIterations
 end
 
 final_objective = objective_from_residuals(model, current_evaluation.residuals);
+final_components = objective_components(model, current_evaluation.residuals);
 final_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 final_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 accepted_count = numel(history);
@@ -103,7 +142,11 @@ if accepted_count > 0
 end
 
 output = struct();
-output.description = "Monitored explicit-S rank-factor gradient optimization (MATLAB).";
+output.description = "Saved-state rank-factor optimizer comparison with optional row-band direction scaling (MATLAB).";
+output.mode = opts.mode;
+output.constraint_weight = opts.constraintWeight;
+output.state_path = opts.statePath;
+output.rowband_diagnostic_path = opts.rowbandDiagnostic;
 output.accepted_steps = accepted_count;
 if accepted_count > 0
     output.state_file = paths.state;
@@ -116,16 +159,22 @@ output.objective_before = initial_objective;
 output.objective_after = final_objective;
 output.objective_change = final_objective - initial_objective;
 output.relative_objective_change = (final_objective - initial_objective) / initial_objective;
+output.objective_components_before = initial_components;
+output.objective_components_after = final_components;
 output.initial_residual_rms = initial_residuals;
 output.final_residual_rms = final_residuals;
 output.gauge_targets = model.gaugeTargets;
 output.gauge_errors_before = initial_gauge_errors;
 output.gauge_errors_after = final_gauge_errors;
-output.line_search_step_multipliers = opts.stepMultipliers;
+output.rowband_use_natural_step = opts.rowbandUseNaturalStep;
+output.include_extra_shrinks = opts.includeExtraShrinks;
+output.use_parallel = opts.useParallel;
+output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
 output.max_iterations = opts.maxIterations;
 output.min_objective_decrease = opts.minObjectiveDecrease;
 output.gauge_tolerance = opts.gaugeTolerance;
+output.target_blocks = cellstr(target_blocks);
 output.ranks = ranks_struct(model);
 output.history = history;
 output.candidate_history = candidate_history;
@@ -152,10 +201,18 @@ function opts = parse_optimizer_options(varargin)
 opts = struct();
 opts.maxIterations = 20;
 opts.outputPrefix = "matlab_rank_optimization";
+opts.mode = "vanilla";
+opts.statePath = "";
+opts.rowbandDiagnostic = "";
+opts.constraintWeight = 10.0;
 opts.minObjectiveDecrease = 1.0e-10;
 opts.gaugeTolerance = 1.0e-8;
 opts.initialStepScale = 3.0e-16;
 opts.stepMultipliers = [10.0, 3.0, 1.0, 0.3, 0.1, 0.03, 0.01];
+opts.extraShrinks = [0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001];
+opts.includeExtraShrinks = false;
+opts.rowbandUseNaturalStep = true;
+opts.useParallel = false;
 
 if ~isempty(varargin) && isnumeric(varargin{1})
     opts.maxIterations = varargin{1};
@@ -174,12 +231,32 @@ for k = 1:2:numel(varargin)
             opts.maxIterations = value;
         case "outputprefix"
             opts.outputPrefix = string(value);
+        case "mode"
+            opts.mode = lower(string(value));
+        case {"statepath", "state"}
+            opts.statePath = string(value);
+        case {"rowbanddiagnostic", "pqdiagnostic"}
+            opts.rowbandDiagnostic = string(value);
+        case "constraintweight"
+            opts.constraintWeight = value;
         case "minobjectivedecrease"
             opts.minObjectiveDecrease = value;
         case "gaugetolerance"
             opts.gaugeTolerance = value;
         case "initialstepscale"
             opts.initialStepScale = value;
+        case "stepmultipliers"
+            opts.stepMultipliers = value;
+        case "includeextrashrinks"
+            opts.includeExtraShrinks = logical_option(value);
+        case "noextrashrinks"
+            opts.includeExtraShrinks = ~logical_option(value);
+        case "fixedrowbandstepscale"
+            opts.rowbandUseNaturalStep = ~logical_option(value);
+        case "rowbandusenaturalstep"
+            opts.rowbandUseNaturalStep = logical_option(value);
+        case "useparallel"
+            opts.useParallel = logical_option(value);
         otherwise
             error("Unknown optimizer option: %s", varargin{k});
     end
@@ -187,6 +264,13 @@ end
 
 if opts.maxIterations < 1 || opts.maxIterations ~= floor(opts.maxIterations)
     error("MaxIterations must be a positive integer.");
+end
+valid_modes = ["vanilla", "raw_pq", "raw_all", "rowband_pq", "rowband_all"];
+if ~any(opts.mode == valid_modes)
+    error("Unknown optimizer mode: %s", opts.mode);
+end
+if opts.constraintWeight <= 0
+    error("ConstraintWeight must be positive.");
 end
 end
 
@@ -201,7 +285,216 @@ paths.history = sprintf("%s_history.csv", prefix);
 paths.state = sprintf("%s_state.mat", prefix);
 end
 
-function model = build_model()
+function value = logical_option(raw)
+% Accept MATLAB logicals, numeric 0/1, and simple strings in name-value args.
+
+if islogical(raw)
+    value = raw;
+elseif isnumeric(raw)
+    value = raw ~= 0;
+else
+    text = lower(string(raw));
+    value = any(text == ["true", "1", "yes", "on"]);
+end
+end
+
+function multipliers = effective_step_multipliers(opts)
+% The pushed row-band result used the original seven-point bracket; the extra
+% shrink factors remain available for exploratory runs that need them.
+
+multipliers = opts.stepMultipliers;
+if opts.includeExtraShrinks
+    multipliers = [multipliers, opts.extraShrinks];
+end
+end
+
+function steps = line_search_steps(opts, stepScale)
+% Build the actual trial step sizes for the current trusted scale.
+
+steps = stepScale * effective_step_multipliers(opts);
+end
+
+function yes = is_rowband_mode(mode)
+yes = startsWith(string(mode), "rowband_");
+end
+
+function yes = mode_needs_diagnostic(mode)
+% raw_all needs the diagnostic for its target block list; rowband modes also
+% need the measured safe step attached to each target block/group.
+
+mode = string(mode);
+yes = mode == "raw_all" || is_rowband_mode(mode);
+end
+
+function diagnostic = read_rowband_diagnostic(path, mode)
+% Load the JSON emitted by diagnose_pq_support_step_scaling.py when a mode
+% needs either its target list or measured row-band/block scales.
+
+if ~mode_needs_diagnostic(mode)
+    diagnostic = [];
+    return
+end
+if strlength(string(path)) == 0
+    error("%s mode requires RowbandDiagnostic.", mode);
+end
+diagnostic = jsondecode(fileread(path));
+end
+
+function blocks = pq_target_blocks()
+% Velocity P/Q blocks used by the first pushed row-band experiment.
+
+blocks = ["u1_P", "u1_Q", "u2_P", "u2_Q"];
+end
+
+function blocks = target_blocks_for_mode(mode, diagnostic)
+% Keep P/Q modes backward-compatible and let all-variable modes follow the
+% diagnostic that recorded which P/Q/s/scalar groups were actually probed.
+
+mode = string(mode);
+if mode == "raw_all" || mode == "rowband_all"
+    blocks = target_blocks_from_diagnostic(diagnostic);
+else
+    blocks = pq_target_blocks();
+end
+end
+
+function blocks = target_blocks_from_diagnostic(diagnostic)
+if isempty(diagnostic) || ~isfield(diagnostic, "target_blocks")
+    error("Row-band diagnostic does not contain target_blocks.");
+end
+blocks = json_string_array(diagnostic.target_blocks);
+end
+
+function out = json_string_array(value)
+% jsondecode has changed string-array behavior across MATLAB releases. This
+% helper normalizes char/cell/string results into a row string array.
+
+if iscell(value)
+    out = strings(1, numel(value));
+    for k = 1:numel(value)
+        out(k) = string(value{k});
+    end
+elseif ischar(value)
+    out = string(value);
+else
+    out = string(value);
+    out = reshape(out, 1, []);
+end
+end
+
+function variables = load_optimizer_state(path, model)
+% Load a MATLAB state file with the same variable field names as the optimizer.
+% This mirrors the Python saved-state entry point, but keeps MATLAB free of a
+% runtime NumPy/NPZ dependency.
+
+data = load(path);
+variables = struct();
+for keyName = model.variableKeys
+    key = char(keyName);
+    if ~isfield(data, key)
+        error("State file %s is missing variable %s.", path, key);
+    end
+    value = double(data.(key));
+    targetSize = size(model.variables.(key));
+    if ~isequal(size(value), targetSize)
+        if numel(value) ~= numel(model.variables.(key))
+            error("State variable %s has size [%s], expected [%s].", ...
+                key, num2str(size(value)), num2str(targetSize));
+        end
+        value = reshape(value, targetSize);
+    end
+    variables.(key) = value;
+end
+end
+
+function direction = raw_direction_for_mode(mode, variables, gradient, diagnostic, targetBlocks, model)
+% Select the descent direction family requested by Mode.
+
+mode = string(mode);
+switch mode
+    case "vanilla"
+        direction = scale_variables(gradient, -1.0, model.variableKeys);
+    case {"raw_pq", "raw_all"}
+        direction = selected_raw_direction(variables, gradient, targetBlocks, model.variableKeys);
+    case {"rowband_pq", "rowband_all"}
+        direction = rowband_direction(variables, gradient, diagnostic, targetBlocks, model.variableKeys);
+    otherwise
+        error("Unknown optimizer mode: %s", mode);
+end
+end
+
+function direction = selected_raw_direction(variables, gradient, targetBlocks, keys)
+% Control direction: move only selected blocks, with the raw negative gradient.
+
+direction = zero_like_variables(variables, keys);
+for blockName = targetBlocks
+    block = char(blockName);
+    direction.(block) = -gradient.(block);
+end
+end
+
+function direction = rowband_direction(variables, gradient, diagnostic, targetBlocks, keys)
+% Measured row-band direction used by the pushed optimizer.
+%
+% Each group keeps the local negative-gradient direction but replaces that
+% group's norm by the largest accepted unit step measured in the diagnostic.
+
+direction = zero_like_variables(variables, keys);
+for blockName = targetBlocks
+    block = char(blockName);
+    blockGradient = gradient.(block);
+    blockDirection = zeros(size(blockGradient));
+    groups = diagnostic.block_results.(block).groups;
+    for k = 1:numel(groups)
+        group = groups(k);
+        safeStep = group_safe_step(group);
+        if isempty(safeStep) || safeStep <= 0
+            continue
+        end
+        rows = (double(group.row_min) + 1):(double(group.row_max) + 1);
+        blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, rows, safeStep);
+    end
+    direction.(block) = blockDirection;
+end
+end
+
+function safeStep = group_safe_step(group)
+% JSON null decodes to [] in MATLAB, which means "this group had no accepted
+% measured unit step" and should be left at zero movement.
+
+safeStep = group.trial_summary.largest_accepted_step;
+if isempty(safeStep)
+    return
+end
+safeStep = double(safeStep);
+end
+
+function blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, rows, safeStep)
+% Scale one row band, singular-value vector, or scalar rate to its safe step.
+
+if numel(blockGradient) == 1
+    normValue = abs(blockGradient);
+    if normValue > 0
+        blockDirection = -blockGradient * (safeStep / normValue);
+    end
+elseif isvector(blockGradient)
+    rows = rows(rows >= 1 & rows <= numel(blockGradient));
+    chunk = blockGradient(rows);
+    normValue = norm(chunk(:));
+    if normValue > 0
+        blockDirection(rows) = -chunk * (safeStep / normValue);
+    end
+else
+    rows = rows(rows >= 1 & rows <= size(blockGradient, 1));
+    chunk = blockGradient(rows, :);
+    normValue = norm(chunk(:));
+    if normValue > 0
+        blockDirection(rows, :) = -chunk * (safeStep / normValue);
+    end
+end
+end
+
+function model = build_model(constraintWeight)
 % Build every fixed quantity needed by the reduced rank-factor objective.
 %
 % The dependent variables are omega, zeta, u1, and u2. Each is represented by
@@ -215,7 +508,7 @@ model.x2 = double(data.x2(:));
 model.x1Col = model.x1;
 model.x2Row = model.x2';
 model.nGrid = numel(model.x1) * numel(model.x2);
-model.constraintWeight = 10.0;
+model.constraintWeight = constraintWeight;
 
 omega = double(data.w);
 zeta = double(data.v);
@@ -461,6 +754,18 @@ value = 0.5 * mean((residuals.fomega ./ model.scales.fomega) .^ 2, "all") ...
     + 0.5 * mean((residuals.fzeta ./ model.scales.fzeta) .^ 2, "all") ...
     + 0.5 * model.constraintWeight * mean((residuals.divergence ./ model.scales.divergence) .^ 2, "all") ...
     + 0.5 * model.constraintWeight * mean((residuals.curl ./ model.scales.curl) .^ 2, "all");
+end
+
+function components = objective_components(model, residuals)
+% Return the four objective terms separately, matching the pushed JSON output.
+
+components = struct();
+components.fomega = 0.5 * mean((residuals.fomega ./ model.scales.fomega) .^ 2, "all");
+components.fzeta = 0.5 * mean((residuals.fzeta ./ model.scales.fzeta) .^ 2, "all");
+components.divergence = 0.5 * model.constraintWeight * ...
+    mean((residuals.divergence ./ model.scales.divergence) .^ 2, "all");
+components.curl = 0.5 * model.constraintWeight * ...
+    mean((residuals.curl ./ model.scales.curl) .^ 2, "all");
 end
 
 function out = residual_rms_from_residuals(residuals)
@@ -773,13 +1078,14 @@ gram = factors' * factors;
 value = norm(gram - eye(size(gram)), "fro");
 end
 
-function [summary, candidate, candidate_evaluation] = candidate_summary(model, base_variables, direction, step, base_objective, opts)
+function [summary, candidate, candidate_evaluation] = candidate_summary(model, base_variables, direction, step, base_objective, base_components, opts)
 % Build one line-search candidate and record the fields needed for acceptance.
 
 candidate = add_scaled_variables(base_variables, direction, step, model.variableKeys);
 candidate = retract_variables(model, candidate, false, 1.0e-10);
 candidate_evaluation = evaluate_model(model, candidate);
 candidate_objective = objective_from_residuals(model, candidate_evaluation.residuals);
+components = objective_components(model, candidate_evaluation.residuals);
 gauge_errors = gauge_errors_from_fields(model, candidate_evaluation.fields);
 objective_change = candidate_objective - base_objective;
 summary = struct();
@@ -790,9 +1096,11 @@ summary.accepted = objective_change < -opts.minObjectiveDecrease ...
     && max_abs_struct(gauge_errors) <= opts.gaugeTolerance;
 summary.gauge_errors = gauge_errors;
 summary.max_abs_gauge_error = max_abs_struct(gauge_errors);
+summary.objective_components = components;
+summary.objective_component_changes = subtract_component_structs(components, base_components);
 end
 
-function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals)
+function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals, mode, searchStepScale, components)
 % CSV-friendly record for one accepted step.
 
 row = struct();
@@ -810,6 +1118,22 @@ row.fomega_rms = residuals.fomega;
 row.fzeta_rms = residuals.fzeta;
 row.divergence_rms = residuals.divergence;
 row.curl_rms = residuals.curl;
+row.mode = mode;
+row.search_step_scale = searchStepScale;
+row.fomega_loss = components.fomega;
+row.fzeta_loss = components.fzeta;
+row.divergence_loss = components.divergence;
+row.curl_loss = components.curl;
+end
+
+function out = subtract_component_structs(left, right)
+% Difference of the four named objective components for candidate diagnostics.
+
+out = struct();
+out.fomega = left.fomega - right.fomega;
+out.fzeta = left.fzeta - right.fzeta;
+out.divergence = left.divergence - right.divergence;
+out.curl = left.curl - right.curl;
 end
 
 function variables = copy_variables(variables)

@@ -34,6 +34,24 @@ The corresponding native MATLAB optimizer is `optimize_rank_factors.m`:
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors(20);"
 ```
 
+The MATLAB equivalent of the pushed all-variable row-band setup is
+`optimize_rank_factors_pq_rowband.m`:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2);"
+```
+
+It accepts the same leading iteration-count shorthand and forwards name-value
+options to `optimize_rank_factors.m`. For example, when Parallel Computing
+Toolbox is available:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2,'UseParallel',true);"
+```
+
+`UseParallel` defaults to `false`; the warmed 4-worker test was slightly slower
+than serial for the current 7-candidate line search.
+
 ## Reading MATLAB Data From Python
 
 `data.mat` is a MATLAB v5 MAT file. It is not a MATLAB `-v7.3` HDF5 file. The
