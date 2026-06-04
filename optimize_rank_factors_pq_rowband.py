@@ -8,6 +8,8 @@ This experiment starts from an existing optimizer state and runs one of:
 * ``rowband_pq``: only u1/u2 P/Q blocks, with each coordinate row band scaled
   by the largest accepted unit step measured by
   ``diagnose_pq_support_step_scaling.py``.
+* ``rowband_all``: every optimized variable, using row bands for P/Q blocks and
+  one measured block scale for non-spatial ``s``, ``cl``, and ``cw`` variables.
 
 The objective itself is unchanged.  Every trial point is retracted/refit before
 evaluation, exactly like the existing monitored optimizer.
@@ -57,10 +59,10 @@ DEFAULT_STATE = Path("compare_curl_trust_rank_optimization_state.npz")
 DEFAULT_PQ_DIAGNOSTIC = Path("pq_support_step_scaling_diagnostic_results.json")
 DEFAULT_OUTPUT_PREFIX = "pq_rowband_rank_optimization"
 
-# The large-gradient localization diagnostics showed that useful progress comes
-# from the velocity P/Q coefficient blocks.  The row-band mode therefore leaves
-# omega/zeta/scalar variables untouched and shapes only these four blocks.
-TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
+# The pushed row-band result used only the velocity P/Q coefficient blocks.
+# ``rowband_all`` below can instead read target_blocks from a diagnostic JSON
+# generated with ``diagnose_pq_support_step_scaling.py --target-scope all``.
+PQ_TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
 
 # Optional extra shrink factors are useful for exploratory runs from difficult
 # states.  The committed 3e-4 result used ``--no-extra-shrinks`` so it matches
@@ -112,47 +114,124 @@ def zero_like_variables(variables: VariableDict) -> VariableDict:
     }
 
 
-def raw_pq_direction(variables: VariableDict, gradient: VariableDict) -> VariableDict:
-    """Use only the unscaled velocity P/Q part of the negative gradient."""
+def target_blocks_from_diagnostic(pq_diagnostic: dict[str, Any]) -> tuple[str, ...]:
+    """Read target blocks from a diagnostic JSON.
 
-    direction = zero_like_variables(variables)
-    for block in TARGET_BLOCKS:
-        value = gradient[block]
-        assert isinstance(value, np.ndarray)
-        direction[block] = -value
-    return direction
+    For ``rowband_pq`` the target list is hard-coded for backward
+    compatibility with the pushed P/Q result.  For ``rowband_all`` the
+    diagnostic is authoritative because it records exactly which P/Q/s/scalar
+    groups were probed and should therefore be moved.
+    """
+
+    target_blocks = pq_diagnostic.get("target_blocks")
+    if not target_blocks:
+        raise ValueError("row-band diagnostic does not contain target_blocks")
+    return tuple(str(block) for block in target_blocks)
 
 
-def rowband_pq_direction(
+def selected_raw_direction(
     variables: VariableDict,
     gradient: VariableDict,
-    pq_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
 ) -> VariableDict:
-    """Build the measured row-band-scaled P/Q descent direction.
+    """Use only selected blocks of the unscaled negative gradient.
 
-    The diagnostic JSON stores, for each coordinate row band, the largest
-    accepted unit-norm step found in isolation.  This function converts each
-    band of the raw gradient into a chunk whose norm is that safe step, giving
-    high-curvature near-axis rows much less movement than safer far-field rows.
+    This is a control mode for checking whether the benefit comes from the
+    row-band safe-step scaling or merely from widening the variable set.
     """
 
     direction = zero_like_variables(variables)
-    for block in TARGET_BLOCKS:
+    for block in target_blocks:
+        value = gradient[block]
+        direction[block] = -value.copy() if isinstance(value, np.ndarray) else -float(value)
+    return direction
+
+
+def apply_safe_step_to_group(
+    block_direction: np.ndarray | float,
+    block_gradient: np.ndarray | float,
+    rows: range | None,
+    safe_step: float,
+) -> np.ndarray | float:
+    """Scale one block group to its measured safe step.
+
+    P/Q groups pass a row range, singular-value vectors pass all rows, and
+    scalar rates pass ``rows=None``.  The returned chunk always keeps the raw
+    negative-gradient direction and replaces only the chunk norm.
+    """
+
+    if isinstance(block_gradient, np.ndarray):
+        assert isinstance(block_direction, np.ndarray)
+        if rows is None:
+            # A non-spatial array block such as ``omega_s`` is probed as a
+            # single vector, so the whole array gets one measured scale.
+            chunk = block_gradient
+            norm = float(np.linalg.norm(chunk))
+            if norm > 0.0:
+                block_direction[...] = -chunk * (safe_step / norm)
+        elif block_gradient.ndim == 1:
+            row_list = list(rows)
+            chunk = block_gradient[row_list]
+            norm = float(np.linalg.norm(chunk))
+            if norm > 0.0:
+                block_direction[row_list] = -chunk * (safe_step / norm)
+        else:
+            row_list = list(rows)
+            chunk = block_gradient[row_list, :]
+            norm = float(np.linalg.norm(chunk))
+            if norm > 0.0:
+                block_direction[row_list, :] = -chunk * (safe_step / norm)
+        return block_direction
+
+    gradient_value = float(block_gradient)
+    norm = abs(gradient_value)
+    if norm > 0.0:
+        # Scalars have no row structure.  Their "unit direction" is simply the
+        # sign of the negative gradient, scaled by the measured safe step.
+        return -gradient_value * (safe_step / norm)
+    return block_direction
+
+
+def rowband_direction(
+    variables: VariableDict,
+    gradient: VariableDict,
+    pq_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
+) -> VariableDict:
+    """Build the measured row-band-scaled descent direction.
+
+    The diagnostic JSON stores the largest accepted unit-norm step found for
+    each P/Q coordinate row band and for each non-spatial block.  This function
+    preserves the local raw descent direction but replaces each group's raw
+    magnitude with the measured safe step.
+    """
+
+    direction = zero_like_variables(variables)
+    for block in target_blocks:
         block_gradient = gradient[block]
-        assert isinstance(block_gradient, np.ndarray)
-        block_direction = np.zeros_like(block_gradient)
+        block_direction: np.ndarray | float
+        if isinstance(block_gradient, np.ndarray):
+            block_direction = np.zeros_like(block_gradient)
+        else:
+            block_direction = 0.0
         for group in pq_diagnostic["block_results"][block]["groups"]:
             safe_step = group["trial_summary"]["largest_accepted_step"]
             if safe_step is None:
                 continue
-            rows = list(range(group["row_min"], group["row_max"] + 1))
-            chunk = block_gradient[rows, :]
-            norm = float(np.linalg.norm(chunk))
-            if norm > 0.0:
-                # This is the core preconditioner: preserve the local descent
-                # direction but replace its raw magnitude with the safe
-                # row-band step measured by the diagnostic.
-                block_direction[rows, :] = -chunk * (safe_step / norm)
+            rows = (
+                range(int(group["row_min"]), int(group["row_max"]) + 1)
+                if isinstance(block_gradient, np.ndarray)
+                else None
+            )
+            # This is the core preconditioner: preserve the local descent
+            # direction but replace its raw magnitude with the safe
+            # row-band/block step measured by the diagnostic.
+            block_direction = apply_safe_step_to_group(
+                block_direction,
+                block_gradient,
+                rows,
+                float(safe_step),
+            )
         direction[block] = block_direction
     return direction
 
@@ -168,11 +247,24 @@ def raw_direction_for_mode(
     if mode == "vanilla":
         return negative_gradient(gradient)
     if mode == "raw_pq":
-        return raw_pq_direction(variables, gradient)
+        return selected_raw_direction(variables, gradient, PQ_TARGET_BLOCKS)
+    if mode == "raw_all":
+        if pq_diagnostic is None:
+            raise ValueError("raw_all mode requires a diagnostic JSON with target_blocks")
+        return selected_raw_direction(variables, gradient, target_blocks_from_diagnostic(pq_diagnostic))
     if mode == "rowband_pq":
         if pq_diagnostic is None:
             raise ValueError("rowband_pq mode requires a P/Q diagnostic JSON")
-        return rowband_pq_direction(variables, gradient, pq_diagnostic)
+        return rowband_direction(variables, gradient, pq_diagnostic, PQ_TARGET_BLOCKS)
+    if mode == "rowband_all":
+        if pq_diagnostic is None:
+            raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
+        return rowband_direction(
+            variables,
+            gradient,
+            pq_diagnostic,
+            target_blocks_from_diagnostic(pq_diagnostic),
+        )
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -234,9 +326,13 @@ def run_optimizer(
 ) -> dict[str, Any]:
     """Run a saved-state optimizer comparison.
 
-    ``vanilla`` and ``raw_pq`` modes are controls.  ``rowband_pq`` is the pushed
-    recommendation: it uses the measured band scales as the natural direction
-    magnitude, then still performs an ordinary line search/retraction check.
+    ``vanilla``, ``raw_pq``, and ``raw_all`` modes are controls.  ``rowband_pq``
+    reproduces the pushed recommendation.  ``rowband_all`` tests the same
+    measured-scale idea across every optimizer variable.
+
+    The objective and acceptance logic are deliberately unchanged across modes
+    so the resulting JSON/CSV files differ only by the direction family and the
+    chosen constraint weight.
     """
 
     if max_iterations < 1:
@@ -280,7 +376,7 @@ def run_optimizer(
             break
 
         search_scale = step_scale
-        if mode == "rowband_pq" and rowband_use_natural_step:
+        if mode.startswith("rowband_") and rowband_use_natural_step:
             # The row-band direction norm is already in units of "largest safe
             # unit-band steps", so using it as the line-search scale avoids
             # collapsing back to the tiny vanilla gradient step size.
@@ -392,7 +488,11 @@ def run_optimizer(
         "max_iterations": max_iterations,
         "min_objective_decrease": MIN_OBJECTIVE_DECREASE,
         "gauge_tolerance": GAUGE_TOLERANCE,
-        "target_blocks": TARGET_BLOCKS,
+        "target_blocks": (
+            target_blocks_from_diagnostic(pq_diagnostic)
+            if pq_diagnostic is not None and mode in ("rowband_all", "raw_all")
+            else PQ_TARGET_BLOCKS
+        ),
         "ranks": {core.name: int(core.rank) for core in model.cores},
         "history": history,
         "candidate_history": candidate_history,
@@ -405,7 +505,7 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("vanilla", "raw_pq", "rowband_pq"),
+        choices=("vanilla", "raw_pq", "raw_all", "rowband_pq", "rowband_all"),
         default="rowband_pq",
     )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)

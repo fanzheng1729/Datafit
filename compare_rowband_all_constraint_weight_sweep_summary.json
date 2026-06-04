@@ -1,0 +1,398 @@
+{
+  "description": "constraint-weight sweep for all-variable row-band optimizer; stopped at practical coarse/midpoint sweep",
+  "recommendation": "Use constraint_weight=0.007 as the best observed practical tradeoff: divergence remains essentially unchanged while curl and profile residuals improve strongly.",
+  "recommended": {
+    "file": "compare_rowband_all_cw0p007_30_from_curl_trust_rank_optimization_results.json",
+    "mode": "rowband_all",
+    "constraint_weight": 0.007,
+    "accepted_steps": 30,
+    "objective_after": 0.476406859229518,
+    "objective_change": -0.5305222266145776,
+    "objective_components_after": {
+      "fomega": 0.29858471086070176,
+      "fzeta": 0.17300637366607088,
+      "divergence": 0.0034343111245525807,
+      "curl": 0.001381463578192748
+    },
+    "final_residual_rms": {
+      "fomega": 6.151491763432482e-08,
+      "fzeta": 2.7704088477878426e-08,
+      "divergence": 1.2183404396566856e-09,
+      "curl": 4.817087576647768e-06
+    },
+    "residual_ratios": {
+      "fomega": 0.7727673978140198,
+      "fzeta": 0.5882284855194763,
+      "divergence": 0.9905746150474278,
+      "curl": 0.6347127217994224
+    },
+    "profile_geomean_ratio": 0.6742134647683681,
+    "max_gauge_after": 1.2145839889399213e-13
+  },
+  "rows": [
+    {
+      "file": "compare_rowband_pq_cw0p0003_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_pq",
+      "constraint_weight": 0.0003,
+      "accepted_steps": 30,
+      "objective_after": 1.000227625747525,
+      "objective_change": -6.93061937349082e-05,
+      "objective_components_after": {
+        "fomega": 0.49999072234529146,
+        "fzeta": 0.49999230730658795,
+        "divergence": 9.86010620500045e-05,
+        "curl": 0.0001459950335956016
+      },
+      "final_residual_rms": {
+        "fomega": 7.960267035839479e-08,
+        "fzeta": 4.709713350151122e-08,
+        "divergence": 9.971902658862992e-10,
+        "curl": 7.564361162569044e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.9999907469205396,
+        "fzeta": 0.9999923128322354,
+        "divergence": 0.8107679361260564,
+        "curl": 0.9967010534421742
+      },
+      "profile_geomean_ratio": 0.999991529876081,
+      "max_gauge_after": 8.43769498715119e-15
+    },
+    {
+      "file": "compare_rowband_all_cw0p0003_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.0003,
+      "accepted_steps": 30,
+      "objective_after": 0.46811771294739657,
+      "objective_change": -0.5321792189938634,
+      "objective_components_after": {
+        "fomega": 0.29587350558013864,
+        "fzeta": 0.17126686970595476,
+        "divergence": 0.0008609423781721899,
+        "curl": 0.00011639528313093825
+      },
+      "final_residual_rms": {
+        "fomega": 6.123499724726865e-08,
+        "fzeta": 2.7564460326435982e-08,
+        "divergence": 2.946620981043147e-09,
+        "curl": 6.754153173668153e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.769250960542879,
+        "fzeta": 0.5852638236023568,
+        "divergence": 2.395757252225813,
+        "curl": 0.8899458181103747
+      },
+      "profile_geomean_ratio": 0.6709804456741725,
+      "max_gauge_after": 1.0402789740737717e-12
+    },
+    {
+      "file": "compare_rowband_all_cw0,001_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.001,
+      "accepted_steps": 30,
+      "objective_after": 0.4701114074675988,
+      "objective_change": -0.5308784360754502,
+      "objective_components_after": {
+        "fomega": 0.29615644121295864,
+        "fzeta": 0.17155103694052365,
+        "divergence": 0.0020957308734016224,
+        "curl": 0.0003081984407148391
+      },
+      "final_residual_rms": {
+        "fomega": 6.126426891634447e-08,
+        "fzeta": 2.758731842520749e-08,
+        "divergence": 2.518057349401095e-09,
+        "curl": 6.019758393216973e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7696186793403886,
+        "fzeta": 0.5857491593618406,
+        "divergence": 2.0473125641739416,
+        "curl": 0.7931799398574741
+      },
+      "profile_geomean_ratio": 0.6714190155579469,
+      "max_gauge_after": 1.673328142715036e-12
+    },
+    {
+      "file": "compare_rowband_all_cw0,003_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.003,
+      "accepted_steps": 30,
+      "objective_after": 0.4737049208574261,
+      "objective_change": -0.529264670119305,
+      "objective_components_after": {
+        "fomega": 0.2972070571249476,
+        "fzeta": 0.1702337801553943,
+        "divergence": 0.005416997842840671,
+        "curl": 0.0008470857342435006
+      },
+      "final_residual_rms": {
+        "fomega": 6.13728403061371e-08,
+        "fzeta": 2.7481199538880776e-08,
+        "divergence": 2.337311335811952e-09,
+        "curl": 5.7619156854310245e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7709825831476871,
+        "fzeta": 0.5834959846422024,
+        "divergence": 1.9003565845440817,
+        "curl": 0.759205874771275
+      },
+      "profile_geomean_ratio": 0.6707199426703729,
+      "max_gauge_after": 5.46229728115577e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0p005_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.005,
+      "accepted_steps": 30,
+      "objective_after": 0.47507276252231984,
+      "objective_change": -0.5298765758880934,
+      "objective_components_after": {
+        "fomega": 0.29855199235559476,
+        "fzeta": 0.1729736813064648,
+        "divergence": 0.0025573721082961394,
+        "curl": 0.0009897167519641408
+      },
+      "final_residual_rms": {
+        "fomega": 6.151154718163057e-08,
+        "fzeta": 2.7701470785838614e-08,
+        "divergence": 1.2439697550883665e-09,
+        "curl": 4.824299934849249e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7727250572556942,
+        "fzeta": 0.5881729052384154,
+        "divergence": 1.0114125913973062,
+        "curl": 0.6356630419735555
+      },
+      "profile_geomean_ratio": 0.674163141885258,
+      "max_gauge_after": 7.982503547054876e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0p007_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.007,
+      "accepted_steps": 30,
+      "objective_after": 0.476406859229518,
+      "objective_change": -0.5305222266145776,
+      "objective_components_after": {
+        "fomega": 0.29858471086070176,
+        "fzeta": 0.17300637366607088,
+        "divergence": 0.0034343111245525807,
+        "curl": 0.001381463578192748
+      },
+      "final_residual_rms": {
+        "fomega": 6.151491763432482e-08,
+        "fzeta": 2.7704088477878426e-08,
+        "divergence": 1.2183404396566856e-09,
+        "curl": 4.817087576647768e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7727673978140198,
+        "fzeta": 0.5882284855194763,
+        "divergence": 0.9905746150474278,
+        "curl": 0.6347127217994224
+      },
+      "profile_geomean_ratio": 0.6742134647683681,
+      "max_gauge_after": 1.2145839889399213e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0,01_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.01,
+      "accepted_steps": 30,
+      "objective_after": 0.47861903298881814,
+      "objective_change": -0.5312796740058011,
+      "objective_components_after": {
+        "fomega": 0.2987420928590015,
+        "fzeta": 0.1731322095571355,
+        "divergence": 0.0047139050401211165,
+        "curl": 0.0020308255325600195
+      },
+      "final_residual_rms": {
+        "fomega": 6.15311275488049e-08,
+        "fzeta": 2.771416190726028e-08,
+        "divergence": 1.19423082328802e-09,
+        "curl": 4.886525279199873e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7729710312400778,
+        "fzeta": 0.5884423701276634,
+        "divergence": 0.9709722336637304,
+        "curl": 0.6438620246678198
+      },
+      "profile_geomean_ratio": 0.6744248702879629,
+      "max_gauge_after": 2.9554136915521667e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0p012_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.012,
+      "accepted_steps": 30,
+      "objective_after": 0.480255089978941,
+      "objective_change": -0.5316233644493604,
+      "objective_components_after": {
+        "fomega": 0.3007853931718951,
+        "fzeta": 0.1714131815867633,
+        "divergence": 0.005540452403045188,
+        "curl": 0.0025160628172373697
+      },
+      "final_residual_rms": {
+        "fomega": 6.174119557214514e-08,
+        "fzeta": 2.7576231858977752e-08,
+        "divergence": 1.1818976048345784e-09,
+        "curl": 4.965168130864119e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7756099638112887,
+        "fzeta": 0.5855137632733486,
+        "divergence": 0.9609446808351824,
+        "curl": 0.6542242233274128
+      },
+      "profile_geomean_ratio": 0.6738919117658657,
+      "max_gauge_after": 1.8980372828991676e-12
+    },
+    {
+      "file": "compare_rowband_all_cw0p013_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.013,
+      "accepted_steps": 30,
+      "objective_after": 0.4809186738816452,
+      "objective_change": -0.5319496542634973,
+      "objective_components_after": {
+        "fomega": 0.3007950930379217,
+        "fzeta": 0.17142198630905942,
+        "divergence": 0.0059546834657034685,
+        "curl": 0.0027469110689606197
+      },
+      "final_residual_rms": {
+        "fomega": 6.174219109338851e-08,
+        "fzeta": 2.757694008323281e-08,
+        "divergence": 1.1772142906825245e-09,
+        "curl": 4.984418117110538e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7756224698243063,
+        "fzeta": 0.5855288006813215,
+        "divergence": 0.9571369010370956,
+        "curl": 0.6567606545154813
+      },
+      "profile_geomean_ratio": 0.6739059982947997,
+      "max_gauge_after": 1.3720136138317685e-12
+    },
+    {
+      "file": "compare_rowband_all_cw0p015_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.015,
+      "accepted_steps": 30,
+      "objective_after": 0.48221274406987047,
+      "objective_change": -0.5326353315089543,
+      "objective_components_after": {
+        "fomega": 0.3008127875159944,
+        "fzeta": 0.17143811302026976,
+        "divergence": 0.0067828553718781975,
+        "curl": 0.0031789881617281354
+      },
+      "final_residual_rms": {
+        "fomega": 6.174400708009427e-08,
+        "fzeta": 2.757823721815508e-08,
+        "divergence": 1.1696569624368972e-09,
+        "curl": 4.991863119293482e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.7756452827512359,
+        "fzeta": 0.5855563421653682,
+        "divergence": 0.9509923971906922,
+        "curl": 0.6577416285011415
+      },
+      "profile_geomean_ratio": 0.6739317581073297,
+      "max_gauge_after": 1.4428458428028534e-12
+    },
+    {
+      "file": "compare_rowband_all_cw0p02_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.02,
+      "accepted_steps": 30,
+      "objective_after": 0.552064498273003,
+      "objective_change": -0.46773294589002745,
+      "objective_components_after": {
+        "fomega": 0.3493245082383231,
+        "fzeta": 0.18935222854407702,
+        "divergence": 0.008239089517543223,
+        "curl": 0.005148671973059543
+      },
+      "final_residual_rms": {
+        "fomega": 6.65366899869255e-08,
+        "fzeta": 2.8983312830530978e-08,
+        "divergence": 1.116406803146653e-09,
+        "curl": 5.5016943118380735e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.8358522901063609,
+        "fzeta": 0.6153896824742612,
+        "divergence": 0.9076972275294014,
+        "curl": 0.724918390129257
+      },
+      "profile_geomean_ratio": 0.717199327526133,
+      "max_gauge_after": 4.0123460109953157e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0,03_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.03,
+      "accepted_steps": 30,
+      "objective_after": 0.6166502443624645,
+      "objective_change": -0.4130459369689775,
+      "objective_components_after": {
+        "fomega": 0.37315592420519145,
+        "fzeta": 0.2220349141893196,
+        "divergence": 0.012590770957355253,
+        "curl": 0.008868635010598211
+      },
+      "final_residual_rms": {
+        "fomega": 6.876886148967281e-08,
+        "fzeta": 3.1385095141153475e-08,
+        "divergence": 1.1268429602524284e-09,
+        "curl": 5.895648812734563e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.8638934454876719,
+        "fzeta": 0.6663856490895516,
+        "divergence": 0.9161823700816267,
+        "curl": 0.7768269198270195
+      },
+      "profile_geomean_ratio": 0.7587398726938709,
+      "max_gauge_after": 1.0080825063596421e-13
+    },
+    {
+      "file": "compare_rowband_all_cw0,1_30_from_curl_trust_rank_optimization_results.json",
+      "mode": "rowband_all",
+      "constraint_weight": 0.1,
+      "accepted_steps": 30,
+      "objective_after": 0.7765480616928291,
+      "objective_change": -0.3224392798174931,
+      "objective_components_after": {
+        "fomega": 0.4078839403093893,
+        "fzeta": 0.2846252775190412,
+        "divergence": 0.047251267427121546,
+        "curl": 0.036787576437277196
+      },
+      "final_residual_rms": {
+        "fomega": 7.189769494180274e-08,
+        "fzeta": 3.5534445882231446e-08,
+        "divergence": 1.195651443438376e-09,
+        "curl": 6.57679690922606e-06
+      },
+      "residual_ratios": {
+        "fomega": 0.9031987161111142,
+        "fzeta": 0.7544869524138732,
+        "divergence": 0.9721272722824633,
+        "curl": 0.8665768683993634
+      },
+      "profile_geomean_ratio": 0.8255008459976269,
+      "max_gauge_after": 3.12194714524594e-13
+    }
+  ]
+}
