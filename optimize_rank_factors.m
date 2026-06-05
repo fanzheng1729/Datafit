@@ -805,30 +805,24 @@ function cache = core_eval(core, variables)
 p = variables.(core.pKey);
 q = variables.(core.qKey);
 s = variables.(core.sKey);
-left = core.x0 * p;
-left_x1 = core.x1 * p;
-right = core.y0 * q;
-right_x2 = core.y1 * q;
-[value, x1_derivative, x2_derivative] = synthesize_triplet(left, left_x1, right, right_x2, s);
 cache = struct();
-cache.left = left;
-cache.left_x1 = left_x1;
-cache.right = right;
-cache.right_x2 = right_x2;
+cache.left = core.x0 * p;
+cache.left_x1 = core.x1 * p;
+cache.right = core.y0 * q;
+cache.right_x2 = core.y1 * q;
 cache.s = s(:);
-cache.value = value;
-cache.x1 = x1_derivative;
-cache.x2 = x2_derivative;
+[cache.value, cache.x1, cache.x2] = ...
+    synthesize_triplet(cache.left, cache.left_x1, cache.right, cache.right_x2, s);
 end
 
-function [value, x1_derivative, x2_derivative] = synthesize_triplet(left, left_x1, right, right_x2, s)
+function [value, value_x1, value_x2] = synthesize_triplet(left, left_x1, right, right_x2, s)
 % Matrix form of left*diag(s)*right' plus the two first derivatives.
 
 weighted_left = left .* reshape(s, 1, []);
 weighted_left_x1 = left_x1 .* reshape(s, 1, []);
 value = weighted_left * right';
-x1_derivative = weighted_left_x1 * right';
-x2_derivative = weighted_left * right_x2';
+value_x1 = weighted_left_x1 * right';
+value_x2 = weighted_left * right_x2';
 end
 
 function value = objective(model, variables)

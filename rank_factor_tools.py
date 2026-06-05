@@ -48,19 +48,15 @@ def synthesize_triplet(
     The three fields are
     ``left @ diag(s) @ right.T``,
     ``left_x1 @ diag(s) @ right.T``, and
-    ``left @ diag(s) @ right_x2.T``.  Scaling ``left`` by ``s`` is shared
-    between the value and x2 derivative, and the value/x1 products against
-    ``right.T`` are batched in one matrix multiply.
+    ``left @ diag(s) @ right_x2.T``.
     """
 
     weighted_left = left * singular_values[None, :]
     weighted_left_x1 = left_x1 * singular_values[None, :]
-    value_and_x1 = np.vstack((weighted_left, weighted_left_x1)) @ right.T
-    split = left.shape[0]
-    value = value_and_x1[:split]
-    x1 = value_and_x1[split:]
-    x2 = weighted_left @ right_x2.T
-    return value, x1, x2
+    value = weighted_left @ right.T
+    value_x1 = weighted_left_x1 @ right.T
+    value_x2 = weighted_left @ right_x2.T
+    return value, value_x1, value_x2
 
 
 def weighted_gram(factors: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
