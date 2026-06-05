@@ -826,10 +826,8 @@ function [value, x1_derivative, x2_derivative] = synthesize_triplet(left, left_x
 
 weighted_left = left .* reshape(s, 1, []);
 weighted_left_x1 = left_x1 .* reshape(s, 1, []);
-value_and_x1 = [weighted_left; weighted_left_x1] * right';
-split = size(left, 1);
-value = value_and_x1(1:split, :);
-x1_derivative = value_and_x1(split + 1:end, :);
+value = weighted_left * right';
+x1_derivative = weighted_left_x1 * right';
 x2_derivative = weighted_left * right_x2';
 end
 
