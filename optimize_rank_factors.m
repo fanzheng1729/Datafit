@@ -17,6 +17,11 @@ fprintf("  output prefix:            %s\n", opts.outputPrefix);
 fprintf("  mode:                     %s\n", opts.mode);
 fprintf("  constraint weight:        %.12g\n", opts.constraintWeight);
 fprintf("  parallel candidates:      %d\n", opts.useParallel);
+fprintf("  step sweep warmup:        %d\n", opts.stepSweepInitialIterations);
+fprintf("  step sweep period:        %d\n", opts.stepSweepPeriod);
+fprintf("  step sweep mode:          %s\n", opts.stepSweepMode);
+fprintf("  step sweep start mult:    %.12g\n", opts.stepSweepStartMultiplier);
+fprintf("  recovery step sweep:      %d\n", opts.recoveryStepSweep);
 
 model = build_model(opts.constraintWeight);
 if strlength(opts.statePath) > 0
@@ -40,6 +45,7 @@ initial_components = objective_components(model, current_evaluation.residuals);
 initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 initial_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 step_scale = opts.initialStepScale;
+last_step_multiplier = NaN;
 history = struct([]);
 candidate_history = struct([]);
 stop_reason = "reached maximum iterations";
@@ -72,35 +78,29 @@ for iteration = 1:opts.maxIterations
         search_step_scale = projected_gradient_norm;
     end
 
-    steps = line_search_steps(opts, search_step_scale);
-    candidate_summaries = cell(numel(steps), 1);
-    candidate_variables = cell(numel(steps), 1);
-    candidate_evaluations = cell(numel(steps), 1);
-    if opts.useParallel
-        parfor k = 1:numel(steps)
-            % Each trial is retracted after stepping so P/Q/S return to the
-            % orthonormal chart before the objective and gauge checks are made.
-            [summary, candidate, candidate_evaluation] = candidate_summary( ...
-                model, variables, direction, steps(k), base_objective, base_components, opts);
-            summary.iteration = iteration;
-            candidate_summaries{k} = summary;
-            candidate_variables{k} = candidate;
-            candidate_evaluations{k} = candidate_evaluation;
-        end
+    [step_multipliers, step_search_mode, scheduled_sweep] = step_multipliers_for_iteration( ...
+        opts, iteration, last_step_multiplier);
+    if step_search_mode == "neighbor_sweep"
+        [candidates, candidate_variables, candidate_evaluations] = evaluate_neighbor_step_candidates( ...
+            model, variables, direction, search_step_scale, step_multipliers, ...
+            base_objective, base_components, opts, iteration);
     else
-        for k = 1:numel(steps)
-            [summary, candidate, candidate_evaluation] = candidate_summary( ...
-                model, variables, direction, steps(k), base_objective, base_components, opts);
-            summary.iteration = iteration;
-            candidate_summaries{k} = summary;
-            candidate_variables{k} = candidate;
-            candidate_evaluations{k} = candidate_evaluation;
-        end
+        [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
+            model, variables, direction, search_step_scale, step_multipliers, ...
+            base_objective, base_components, opts, iteration, step_search_mode);
     end
-    candidates = [candidate_summaries{:}];
+    iteration_trial_count = numel(candidates);
     candidate_history = append_struct_array(candidate_history, candidates);
 
     accepted = find([candidates.accepted]);
+    if isempty(accepted) && ~scheduled_sweep && opts.recoveryStepSweep
+        [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
+            model, variables, direction, search_step_scale, effective_step_multipliers(opts), ...
+            base_objective, base_components, opts, iteration, "recovery_sweep");
+        iteration_trial_count = iteration_trial_count + numel(candidates);
+        candidate_history = append_struct_array(candidate_history, candidates);
+        accepted = find([candidates.accepted]);
+    end
     if isempty(accepted)
         stop_reason = "no line-search candidate reduced the objective while preserving gauges";
         break
@@ -112,6 +112,7 @@ for iteration = 1:opts.maxIterations
     variables = candidate_variables{accepted_index};
     current_evaluation = candidate_evaluations{accepted_index};
     step_scale = best.step;
+    last_step_multiplier = best.step_multiplier;
     residuals = residual_rms_from_residuals(current_evaluation.residuals);
     gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
     components = best.objective_components;
@@ -119,12 +120,14 @@ for iteration = 1:opts.maxIterations
     row = history_row( ...
         iteration, best.objective, best.objective_change, best.step, ...
         gradient_norm, projected_gradient_norm, directional_derivative, ...
-        gauge_errors, residuals, opts.mode, search_step_scale, components);
+        gauge_errors, residuals, opts.mode, search_step_scale, components, ...
+        best.step_search_mode, best.step_multiplier, iteration_trial_count);
     history = append_struct(history, row);
 
-    fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e |d_raw|=%.3e div_loss=%.3e curl_loss=%.3e gauge=%.3e\n", ...
+    fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e mult=%.3g search=%s trials=%d |d_raw|=%.3e div_loss=%.3e curl_loss=%.3e gauge=%.3e\n", ...
         iteration, opts.maxIterations, best.objective, best.objective_change, ...
-        best.step, projected_gradient_norm, components.divergence, components.curl, max_abs_struct(gauge_errors));
+        best.step, best.step_multiplier, best.step_search_mode, iteration_trial_count, ...
+        projected_gradient_norm, components.divergence, components.curl, max_abs_struct(gauge_errors));
 
     if abs(best.objective_change) < opts.minObjectiveDecrease
         stop_reason = "accepted decrease fell below the minimum improvement";
@@ -171,6 +174,11 @@ output.include_extra_shrinks = opts.includeExtraShrinks;
 output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
+output.step_sweep_initial_iterations = opts.stepSweepInitialIterations;
+output.step_sweep_period = opts.stepSweepPeriod;
+output.step_sweep_mode = opts.stepSweepMode;
+output.step_sweep_start_multiplier = opts.stepSweepStartMultiplier;
+output.recovery_step_sweep = opts.recoveryStepSweep;
 output.max_iterations = opts.maxIterations;
 output.min_objective_decrease = opts.minObjectiveDecrease;
 output.gauge_tolerance = opts.gaugeTolerance;
@@ -213,6 +221,11 @@ opts.extraShrinks = [0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001];
 opts.includeExtraShrinks = false;
 opts.rowbandUseNaturalStep = true;
 opts.useParallel = false;
+opts.stepSweepInitialIterations = 0;
+opts.stepSweepPeriod = 1;
+opts.stepSweepMode = "full";
+opts.stepSweepStartMultiplier = 1.0;
+opts.recoveryStepSweep = true;
 
 if ~isempty(varargin) && isnumeric(varargin{1})
     opts.maxIterations = varargin{1};
@@ -257,6 +270,16 @@ for k = 1:2:numel(varargin)
             opts.rowbandUseNaturalStep = logical_option(value);
         case "useparallel"
             opts.useParallel = logical_option(value);
+        case {"stepsweepinitialiterations", "initialstepsweeps", "stepsweepwarmup"}
+            opts.stepSweepInitialIterations = value;
+        case {"stepsweepperiod", "stepsweepevery"}
+            opts.stepSweepPeriod = value;
+        case "stepsweepmode"
+            opts.stepSweepMode = lower(string(value));
+        case {"stepsweepstartmultiplier", "stepsweepstartmult"}
+            opts.stepSweepStartMultiplier = value;
+        case {"recoverystepsweep", "recoverstepsweep"}
+            opts.recoveryStepSweep = logical_option(value);
         otherwise
             error("Unknown optimizer option: %s", varargin{k});
     end
@@ -271,6 +294,18 @@ if ~any(opts.mode == valid_modes)
 end
 if opts.constraintWeight <= 0
     error("ConstraintWeight must be positive.");
+end
+if opts.stepSweepInitialIterations < 0 || opts.stepSweepInitialIterations ~= floor(opts.stepSweepInitialIterations)
+    error("StepSweepInitialIterations must be a nonnegative integer.");
+end
+if opts.stepSweepPeriod < 1 || opts.stepSweepPeriod ~= floor(opts.stepSweepPeriod)
+    error("StepSweepPeriod must be a positive integer.");
+end
+if ~any(opts.stepSweepMode == ["full", "neighbor"])
+    error("StepSweepMode must be 'full' or 'neighbor'.");
+end
+if opts.stepSweepStartMultiplier <= 0 || ~isfinite(opts.stepSweepStartMultiplier)
+    error("StepSweepStartMultiplier must be positive and finite.");
 end
 end
 
@@ -308,10 +343,67 @@ if opts.includeExtraShrinks
 end
 end
 
-function steps = line_search_steps(opts, stepScale)
+function steps = line_search_steps(stepScale, multipliers)
 % Build the actual trial step sizes for the current trusted scale.
 
-steps = stepScale * effective_step_multipliers(opts);
+steps = stepScale * multipliers;
+end
+
+function yes = should_sweep_steps(opts, iteration)
+% The default period of one preserves the original full sweep every iteration.
+
+yes = opts.stepSweepPeriod == 1 ...
+    || iteration <= opts.stepSweepInitialIterations ...
+    || mod(iteration, opts.stepSweepPeriod) == 0;
+end
+
+function [multipliers, searchMode, scheduledSweep] = step_multipliers_for_iteration(opts, iteration, lastStepMultiplier)
+% Choose either the full bracket or the last accepted bracket multiplier.
+
+scheduledSweep = should_sweep_steps(opts, iteration);
+if scheduledSweep
+    if opts.stepSweepMode == "neighbor"
+        multipliers = local_step_multiplier_window(opts, lastStepMultiplier);
+        searchMode = "neighbor_sweep";
+    else
+        multipliers = effective_step_multipliers(opts);
+        searchMode = "sweep";
+    end
+elseif isfinite(lastStepMultiplier) && lastStepMultiplier > 0
+    multipliers = lastStepMultiplier;
+    searchMode = "single";
+else
+    multipliers = 1.0;
+    searchMode = "single_default";
+end
+end
+
+function multipliers = local_step_multiplier_window(opts, lastStepMultiplier)
+% First bracket for a neighbor sweep around the old accepted multiplier.
+
+ladder = effective_step_multipliers(opts);
+if isfinite(lastStepMultiplier) && lastStepMultiplier > 0
+    center = lastStepMultiplier;
+else
+    center = opts.stepSweepStartMultiplier;
+end
+centerIndex = nearest_step_multiplier_index(ladder, center);
+indices = neighbor_window_indices(centerIndex, numel(ladder));
+multipliers = ladder(indices);
+end
+
+function index = nearest_step_multiplier_index(ladder, value)
+% Compare in log scale because step multipliers are multiplicative.
+
+[~, index] = min(abs(log(ladder) - log(value)));
+end
+
+function indices = neighbor_window_indices(centerIndex, ladderLength)
+% Return old multiplier plus adjacent larger/smaller ladder entries.
+
+lo = max(1, centerIndex - 1);
+hi = min(ladderLength, centerIndex + 1);
+indices = lo:hi;
 end
 
 function yes = is_rowband_mode(mode)
@@ -1078,6 +1170,106 @@ gram = factors' * factors;
 value = norm(gram - eye(size(gram)), "fro");
 end
 
+function [candidates, candidate_variables, candidate_evaluations] = evaluate_neighbor_step_candidates( ...
+    model, variables, direction, searchStepScale, initialMultipliers, ...
+    baseObjective, baseComponents, opts, iteration)
+% Walk the multiplier ladder locally until the best accepted candidate is interior.
+
+ladder = effective_step_multipliers(opts);
+initialIndices = zeros(size(initialMultipliers));
+for k = 1:numel(initialMultipliers)
+    initialIndices(k) = nearest_step_multiplier_index(ladder, initialMultipliers(k));
+end
+
+candidates = struct([]);
+candidate_variables = cell(0, 1);
+candidate_evaluations = cell(0, 1);
+evaluated = false(1, numel(ladder));
+currentIndices = unique(initialIndices, "stable");
+
+while true
+    newIndices = currentIndices(~evaluated(currentIndices));
+    if ~isempty(newIndices)
+        [newCandidates, newVariables, newEvaluations] = evaluate_step_candidates( ...
+            model, variables, direction, searchStepScale, ladder(newIndices), ...
+            baseObjective, baseComponents, opts, iteration, "neighbor_sweep", newIndices);
+        candidates = append_struct_array(candidates, newCandidates);
+        candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
+        candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
+        evaluated(newIndices) = true;
+    end
+
+    currentMask = ismember([candidates.step_multiplier_index], currentIndices);
+    currentCandidates = candidates(currentMask);
+    accepted = find([currentCandidates.accepted]);
+    if isempty(accepted)
+        break
+    end
+
+    [~, localIndex] = min([currentCandidates(accepted).objective]);
+    best = currentCandidates(accepted(localIndex));
+    bestIndex = best.step_multiplier_index;
+    if bestIndex == currentIndices(1) && bestIndex > 1
+        centerIndex = bestIndex;
+    elseif bestIndex == currentIndices(end) && bestIndex < numel(ladder)
+        centerIndex = bestIndex;
+    else
+        break
+    end
+
+    currentIndices = neighbor_window_indices(centerIndex, numel(ladder));
+    if all(evaluated(currentIndices))
+        break
+    end
+end
+end
+
+function [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
+    model, variables, direction, searchStepScale, stepMultipliers, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, stepMultiplierIndices)
+% Evaluate one line-search bracket or a single trusted step.
+
+if nargin < 11 || isempty(stepMultiplierIndices)
+    ladder = effective_step_multipliers(opts);
+    stepMultiplierIndices = zeros(size(stepMultipliers));
+    for k = 1:numel(stepMultipliers)
+        stepMultiplierIndices(k) = nearest_step_multiplier_index(ladder, stepMultipliers(k));
+    end
+end
+steps = line_search_steps(searchStepScale, stepMultipliers);
+candidate_summaries = cell(numel(steps), 1);
+candidate_variables = cell(numel(steps), 1);
+candidate_evaluations = cell(numel(steps), 1);
+if opts.useParallel
+    parfor k = 1:numel(steps)
+        % Each trial is retracted after stepping so P/Q/S return to the
+        % orthonormal chart before the objective and gauge checks are made.
+        [summary, candidate, candidate_evaluation] = candidate_summary( ...
+            model, variables, direction, steps(k), baseObjective, baseComponents, opts);
+        summary.iteration = iteration;
+        summary.step_multiplier = stepMultipliers(k);
+        summary.step_multiplier_index = stepMultiplierIndices(k);
+        summary.step_search_mode = stepSearchMode;
+        candidate_summaries{k} = summary;
+        candidate_variables{k} = candidate;
+        candidate_evaluations{k} = candidate_evaluation;
+    end
+else
+    for k = 1:numel(steps)
+        [summary, candidate, candidate_evaluation] = candidate_summary( ...
+            model, variables, direction, steps(k), baseObjective, baseComponents, opts);
+        summary.iteration = iteration;
+        summary.step_multiplier = stepMultipliers(k);
+        summary.step_multiplier_index = stepMultiplierIndices(k);
+        summary.step_search_mode = stepSearchMode;
+        candidate_summaries{k} = summary;
+        candidate_variables{k} = candidate;
+        candidate_evaluations{k} = candidate_evaluation;
+    end
+end
+candidates = [candidate_summaries{:}];
+end
+
 function [summary, candidate, candidate_evaluation] = candidate_summary(model, base_variables, direction, step, base_objective, base_components, opts)
 % Build one line-search candidate and record the fields needed for acceptance.
 
@@ -1100,7 +1292,7 @@ summary.objective_components = components;
 summary.objective_component_changes = subtract_component_structs(components, base_components);
 end
 
-function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals, mode, searchStepScale, components)
+function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals, mode, searchStepScale, components, stepSearchMode, stepMultiplier, trialCount)
 % CSV-friendly record for one accepted step.
 
 row = struct();
@@ -1120,6 +1312,9 @@ row.divergence_rms = residuals.divergence;
 row.curl_rms = residuals.curl;
 row.mode = mode;
 row.search_step_scale = searchStepScale;
+row.step_search_mode = stepSearchMode;
+row.accepted_step_multiplier = stepMultiplier;
+row.line_search_trial_count = trialCount;
 row.fomega_loss = components.fomega;
 row.fzeta_loss = components.fzeta;
 row.divergence_loss = components.divergence;

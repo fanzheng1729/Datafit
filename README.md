@@ -58,7 +58,8 @@ u1_x2 - u2_x1 = omega
   as the Python optimizer.
 - `optimize_rank_factors_pq_rowband.m`: MATLAB wrapper for the pushed
   all-variable row-band optimizer setup. It reuses `optimize_rank_factors.m`
-  and defaults to the recorded `constraintWeight = 0.007`, 30-step run.
+  and defaults to the recorded `constraintWeight = 0.007`, 30-step run with a
+  neighbor scheduled step sweep.
 - `runfit.py`: Python equivalent of the MATLAB fit/check path. See
   `README_PYTHON.md` for MAT-file loading and implementation details.
 - `data.mat`: saved profile data, grids, velocity data, far-field coefficients,
@@ -143,9 +144,23 @@ matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_ro
 
 The wrapper defaults to `Mode = rowband_all`, `ConstraintWeight = 0.007`,
 `MaxIterations = 30`, `NoExtraShrinks = true`, and
-`RowbandUseNaturalStep = true`. It reads the converted MATLAB starting state
-`compare_curl_trust_rank_optimization_state.mat` and the diagnostic
-`all_variable_rowband_step_scaling_diagnostic_results.json`.
+`RowbandUseNaturalStep = true`. It also uses `StepSweepInitialIterations = 5`,
+`StepSweepPeriod = 5`, and `StepSweepMode = "neighbor"`. On scheduled sweep
+iterations, the optimizer starts from the last accepted step multiplier, tests
+the adjacent larger/smaller multipliers on the ladder, and keeps walking only
+if the best accepted candidate is at the edge of the local bracket. On
+intervening iterations it uses the last accepted multiplier directly. If that
+single trusted step fails, `RecoveryStepSweep = true` falls back to one full
+bracket sweep for that iteration. The wrapper reads the converted MATLAB
+starting state `compare_curl_trust_rank_optimization_state.mat` and the
+diagnostic `all_variable_rowband_step_scaling_diagnostic_results.json`.
+
+To restore the old full-sweep behavior, set `StepSweepMode` to `"full"` and
+`StepSweepPeriod` to `1`:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(30,'StepSweepMode','full','StepSweepPeriod',1);"
+```
 
 Candidate line-search steps can be evaluated with MATLAB `parfor` when
 Parallel Computing Toolbox is installed:
@@ -157,6 +172,21 @@ matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_ro
 `UseParallel` defaults to `false`. On the current 7-candidate line search,
 serial evaluation was slightly faster than a warmed 4-worker process pool, so
 parallel mode is mainly an optional experiment for heavier candidate workloads.
+The neighbor scheduled-sweep policy is the recommended serial path: in a
+30-step probe it used 50 candidate evaluations instead of 90 for scheduled full
+sweeps or 210 for full sweeps every iteration, accepted all 30 steps, and
+reached the same `J = 0.4762753188` as the scheduled-full run.
+
+Extending the neighbor walk below the original ladder with
+`IncludeExtraShrinks = true` changed the later trajectory but did not improve
+the 30-step result. The run switched from multiplier `0.01` to `0.003` at
+iteration 25, used 55 candidate evaluations, and ended at
+`J = 0.4763737743`. The smaller step was locally better at iteration 25, but
+then produced smaller follow-up decreases than staying at `0.01`, so extra
+shrinks remain an experiment rather than the default. A 60-step comparison
+confirmed the same trend: the default ladder stayed at `0.01` and reached
+`J = 0.4726382314`, while the extended ladder stayed at `0.003` after
+iteration 25 and reached `J = 0.4745918786`.
 
 ## Run Python
 

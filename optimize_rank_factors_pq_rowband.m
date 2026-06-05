@@ -5,7 +5,9 @@ function output = optimize_rank_factors_pq_rowband(varargin)
 % reuses the existing model, gradient, retraction, line search, state saving,
 % and JSON/CSV writers.  Defaults mirror the pushed all-variable comparison:
 % rowband_all, the all-variable diagnostic, 30 accepted attempts from the saved
-% curl-trust state, no extra shrink ladder, and constraintWeight = 0.007.
+% curl-trust state, no extra shrink ladder, constraintWeight = 0.007, and a
+% cheap neighbor step policy that sweeps the first five iterations and then
+% every five.
 %
 % Examples:
 %   optimize_rank_factors_pq_rowband()
@@ -21,7 +23,10 @@ defaults = {
     "OutputPrefix", "matlab_compare_rowband_all_cw0p007_30_from_curl_trust_rank_optimization", ...
     "ConstraintWeight", 0.007, ...
     "NoExtraShrinks", true, ...
-    "RowbandUseNaturalStep", true};
+    "RowbandUseNaturalStep", true, ...
+    "StepSweepInitialIterations", 5, ...
+    "StepSweepPeriod", 5, ...
+    "StepSweepMode", "neighbor"};
 
 if ~isempty(varargin) && isnumeric(varargin{1})
     defaults = [defaults, {"MaxIterations", varargin{1}}]; %#ok<AGROW>
