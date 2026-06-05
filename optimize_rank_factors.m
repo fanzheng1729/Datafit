@@ -21,7 +21,11 @@ fprintf("  step sweep warmup:        %d\n", opts.stepSweepInitialIterations);
 fprintf("  step sweep period:        %d\n", opts.stepSweepPeriod);
 fprintf("  step sweep mode:          %s\n", opts.stepSweepMode);
 fprintf("  step sweep start mult:    %.12g\n", opts.stepSweepStartMultiplier);
+if isfinite(opts.initialStepMultiplier)
+    fprintf("  initial step mult:        %.12g\n", opts.initialStepMultiplier);
+end
 fprintf("  recovery step sweep:      %d\n", opts.recoveryStepSweep);
+fprintf("  checkpoint period:        %d\n", opts.checkpointPeriod);
 
 model = build_model(opts.constraintWeight);
 if strlength(opts.statePath) > 0
@@ -45,11 +49,14 @@ initial_components = objective_components(model, current_evaluation.residuals);
 initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 initial_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 step_scale = opts.initialStepScale;
-last_step_multiplier = NaN;
+last_step_multiplier = opts.initialStepMultiplier;
 history = struct([]);
 candidate_history = struct([]);
 stop_reason = "reached maximum iterations";
 paths = output_paths(opts.outputPrefix);
+if opts.checkpointPeriod > 0
+    fprintf("  checkpoint state:         %s\n", paths.checkpointState);
+end
 
 for iteration = 1:opts.maxIterations
     base_objective = objective_from_residuals(model, current_evaluation.residuals);
@@ -129,6 +136,15 @@ for iteration = 1:opts.maxIterations
         best.step, best.step_multiplier, best.step_search_mode, iteration_trial_count, ...
         projected_gradient_norm, components.divergence, components.curl, max_abs_struct(gauge_errors));
 
+    if should_write_checkpoint(opts, numel(history))
+        write_checkpoint( ...
+            paths, variables, history, current_evaluation, ...
+            initial_objective, initial_components, initial_residuals, ...
+            initial_gauge_errors, model, opts, target_blocks, iteration, ...
+            step_scale, last_step_multiplier);
+        fprintf("    checkpoint:             %s\n", paths.checkpointState);
+    end
+
     if abs(best.objective_change) < opts.minObjectiveDecrease
         stop_reason = "accepted decrease fell below the minimum improvement";
         break
@@ -174,11 +190,18 @@ output.include_extra_shrinks = opts.includeExtraShrinks;
 output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
+output.initial_step_multiplier = opts.initialStepMultiplier;
+output.trusted_step_scale = step_scale;
+output.last_step_multiplier = last_step_multiplier;
 output.step_sweep_initial_iterations = opts.stepSweepInitialIterations;
 output.step_sweep_period = opts.stepSweepPeriod;
 output.step_sweep_mode = opts.stepSweepMode;
 output.step_sweep_start_multiplier = opts.stepSweepStartMultiplier;
 output.recovery_step_sweep = opts.recoveryStepSweep;
+output.checkpoint_period = opts.checkpointPeriod;
+output.checkpoint_state_file = checkpoint_file_field(opts, paths.checkpointState);
+output.checkpoint_history_file = checkpoint_file_field(opts, paths.checkpointHistory);
+output.checkpoint_results_file = checkpoint_file_field(opts, paths.checkpointResults);
 output.max_iterations = opts.maxIterations;
 output.min_objective_decrease = opts.minObjectiveDecrease;
 output.gauge_tolerance = opts.gaugeTolerance;
@@ -225,7 +248,9 @@ opts.stepSweepInitialIterations = 0;
 opts.stepSweepPeriod = 1;
 opts.stepSweepMode = "full";
 opts.stepSweepStartMultiplier = 1.0;
+opts.initialStepMultiplier = NaN;
 opts.recoveryStepSweep = true;
+opts.checkpointPeriod = 0;
 
 if ~isempty(varargin) && isnumeric(varargin{1})
     opts.maxIterations = varargin{1};
@@ -278,8 +303,12 @@ for k = 1:2:numel(varargin)
             opts.stepSweepMode = lower(string(value));
         case {"stepsweepstartmultiplier", "stepsweepstartmult"}
             opts.stepSweepStartMultiplier = value;
+        case {"initialstepmultiplier", "initialstepmult", "laststepmultiplier", "laststepmult"}
+            opts.initialStepMultiplier = value;
         case {"recoverystepsweep", "recoverstepsweep"}
             opts.recoveryStepSweep = logical_option(value);
+        case {"checkpointperiod", "checkpointevery"}
+            opts.checkpointPeriod = value;
         otherwise
             error("Unknown optimizer option: %s", varargin{k});
     end
@@ -307,6 +336,14 @@ end
 if opts.stepSweepStartMultiplier <= 0 || ~isfinite(opts.stepSweepStartMultiplier)
     error("StepSweepStartMultiplier must be positive and finite.");
 end
+if ~(isnumeric(opts.initialStepMultiplier) && isscalar(opts.initialStepMultiplier)) ...
+        || (~isnan(opts.initialStepMultiplier) ...
+        && (opts.initialStepMultiplier <= 0 || ~isfinite(opts.initialStepMultiplier)))
+    error("InitialStepMultiplier must be NaN or a positive finite scalar.");
+end
+if opts.checkpointPeriod < 0 || opts.checkpointPeriod ~= floor(opts.checkpointPeriod)
+    error("CheckpointPeriod must be a nonnegative integer.");
+end
 end
 
 function paths = output_paths(prefix)
@@ -318,6 +355,9 @@ paths = struct();
 paths.results = sprintf("%s_results.json", prefix);
 paths.history = sprintf("%s_history.csv", prefix);
 paths.state = sprintf("%s_state.mat", prefix);
+paths.checkpointResults = sprintf("%s_checkpoint_results.json", prefix);
+paths.checkpointHistory = sprintf("%s_checkpoint_history.csv", prefix);
+paths.checkpointState = sprintf("%s_checkpoint_state.mat", prefix);
 end
 
 function value = logical_option(raw)
@@ -1402,6 +1442,87 @@ out = struct();
 for k = 1:numel(model.cores)
     out.(model.cores(k).name) = model.cores(k).rank;
 end
+end
+
+function yes = should_write_checkpoint(opts, acceptedCount)
+% Checkpoint only after accepted steps, and only when explicitly requested.
+
+yes = opts.checkpointPeriod > 0 ...
+    && acceptedCount > 0 ...
+    && mod(acceptedCount, opts.checkpointPeriod) == 0;
+end
+
+function value = checkpoint_file_field(opts, path)
+% Keep disabled checkpoint fields explicit but empty in the final JSON.
+
+if opts.checkpointPeriod > 0
+    value = path;
+else
+    value = "";
+end
+end
+
+function write_checkpoint(paths, variables, history, current_evaluation, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
+% Write a restart state plus lightweight partial results for long runs.
+
+save(paths.checkpointState, "-struct", "variables", "-v7.3");
+write_history_csv(paths.checkpointHistory, history);
+checkpoint = checkpoint_output( ...
+    paths, history, current_evaluation, initial_objective, initial_components, ...
+    initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, ...
+    stepScale, lastStepMultiplier);
+write_json(paths.checkpointResults, checkpoint);
+end
+
+function output = checkpoint_output(paths, history, current_evaluation, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
+% Build a compact checkpoint JSON.  Candidate history is intentionally omitted.
+
+current_objective = objective_from_residuals(model, current_evaluation.residuals);
+current_components = objective_components(model, current_evaluation.residuals);
+current_residuals = residual_rms_from_residuals(current_evaluation.residuals);
+current_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
+output = struct();
+output.description = "Checkpoint for saved-state rank-factor optimizer comparison (MATLAB).";
+output.output_prefix = opts.outputPrefix;
+output.iteration = iteration;
+output.accepted_steps = numel(history);
+output.mode = opts.mode;
+output.constraint_weight = opts.constraintWeight;
+output.state_path = opts.statePath;
+output.rowband_diagnostic_path = opts.rowbandDiagnostic;
+output.state_file = paths.checkpointState;
+output.history_file = paths.checkpointHistory;
+output.objective_before = initial_objective;
+output.objective_after = current_objective;
+output.objective_change = current_objective - initial_objective;
+output.relative_objective_change = (current_objective - initial_objective) / initial_objective;
+output.objective_components_before = initial_components;
+output.objective_components_after = current_components;
+output.initial_residual_rms = initial_residuals;
+output.final_residual_rms = current_residuals;
+output.gauge_targets = model.gaugeTargets;
+output.gauge_errors_before = initial_gauge_errors;
+output.gauge_errors_after = current_gauge_errors;
+output.rowband_use_natural_step = opts.rowbandUseNaturalStep;
+output.include_extra_shrinks = opts.includeExtraShrinks;
+output.use_parallel = opts.useParallel;
+output.line_search_step_multipliers = effective_step_multipliers(opts);
+output.initial_step_scale = opts.initialStepScale;
+output.initial_step_multiplier = opts.initialStepMultiplier;
+output.trusted_step_scale = stepScale;
+output.last_step_multiplier = lastStepMultiplier;
+output.step_sweep_initial_iterations = opts.stepSweepInitialIterations;
+output.step_sweep_period = opts.stepSweepPeriod;
+output.step_sweep_mode = opts.stepSweepMode;
+output.step_sweep_start_multiplier = opts.stepSweepStartMultiplier;
+output.recovery_step_sweep = opts.recoveryStepSweep;
+output.checkpoint_period = opts.checkpointPeriod;
+output.max_iterations = opts.maxIterations;
+output.min_objective_decrease = opts.minObjectiveDecrease;
+output.gauge_tolerance = opts.gaugeTolerance;
+output.target_blocks = cellstr(target_blocks);
+output.ranks = ranks_struct(model);
+output.history = history;
 end
 
 function write_history_csv(path, history)

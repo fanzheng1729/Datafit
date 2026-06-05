@@ -177,6 +177,24 @@ The neighbor scheduled-sweep policy is the recommended serial path: in a
 sweeps or 210 for full sweeps every iteration, accepted all 30 steps, and
 reached the same `J = 0.4762753188` as the scheduled-full run.
 
+For long MATLAB runs, enable periodic checkpointing:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'CheckpointPeriod',10,'OutputPrefix','matlab_long_rowband');"
+```
+
+This overwrites `matlab_long_rowband_checkpoint_state.mat`,
+`matlab_long_rowband_checkpoint_history.csv`, and
+`matlab_long_rowband_checkpoint_results.json` every 10 accepted steps. Resume
+from the latest checkpoint by passing it as `StatePath`; for neighbor-sweep
+runs, also pass the checkpoint JSON's `last_step_multiplier` as
+`InitialStepMultiplier` so the local step ladder continues from the same
+place:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'StatePath','matlab_long_rowband_checkpoint_state.mat','InitialStepMultiplier',0.01,'OutputPrefix','matlab_long_rowband_resume');"
+```
+
 Extending the neighbor walk below the original ladder with
 `IncludeExtraShrinks = true` changed the later trajectory but did not improve
 the 30-step result. The run switched from multiplier `0.01` to `0.003` at
