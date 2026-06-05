@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare vanilla and row-band-scaled P/Q optimizer steps from a saved state.
+"""Compare vanilla and row-band-scaled optimizer steps from a saved state.
 
 This experiment starts from an existing optimizer state and runs one of:
 
@@ -44,7 +44,6 @@ from optimize_rank_factors import (
     write_history_csv,
 )
 from rank_optimization_model import (
-    CONSTRAINT_WEIGHT,
     DATA_PATH,
     Evaluation,
     RankOptimizationModel,
@@ -56,8 +55,9 @@ from rank_optimization_model import (
 
 
 DEFAULT_STATE = Path("compare_curl_trust_rank_optimization_state.npz")
-DEFAULT_PQ_DIAGNOSTIC = Path("pq_support_step_scaling_diagnostic_results.json")
+DEFAULT_ROWBAND_DIAGNOSTIC = Path("all_variable_rowband_step_scaling_diagnostic_results.json")
 DEFAULT_OUTPUT_PREFIX = "pq_rowband_rank_optimization"
+DEFAULT_CONSTRAINT_WEIGHT = 0.007
 
 # The pushed row-band result used only the velocity P/Q coefficient blocks.
 # ``rowband_all`` below can instead read target_blocks from a diagnostic JSON
@@ -65,8 +65,8 @@ DEFAULT_OUTPUT_PREFIX = "pq_rowband_rank_optimization"
 PQ_TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
 
 # Optional extra shrink factors are useful for exploratory runs from difficult
-# states.  The committed 3e-4 result used ``--no-extra-shrinks`` so it matches
-# the original seven-point vanilla bracket.
+# states.  The recommended row-band result leaves them disabled because the
+# 30-step and 60-step checks both favored staying on the original ladder.
 EXTRA_SHRINKS = [0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001]
 
 
@@ -268,13 +268,94 @@ def raw_direction_for_mode(
     raise ValueError(f"unknown mode: {mode}")
 
 
-def line_search_steps(step_scale: float, *, include_extra_shrinks: bool) -> list[float]:
-    """Return trial step lengths for the current mode and trusted scale."""
+def effective_step_multipliers(*, include_extra_shrinks: bool) -> list[float]:
+    """Return the active multiplier ladder for the line search."""
 
     multipliers = list(STEP_MULTIPLIERS)
     if include_extra_shrinks:
         multipliers.extend(EXTRA_SHRINKS)
+    return multipliers
+
+
+def line_search_steps(step_scale: float, multipliers: list[float]) -> list[float]:
+    """Return trial step lengths for the current mode and trusted scale."""
+
     return [step_scale * multiplier for multiplier in multipliers]
+
+
+def should_sweep_steps(iteration: int, *, step_sweep_initial_iterations: int, step_sweep_period: int) -> bool:
+    """Return whether this iteration should search around the trusted step."""
+
+    return (
+        step_sweep_period == 1
+        or iteration <= step_sweep_initial_iterations
+        or iteration % step_sweep_period == 0
+    )
+
+
+def nearest_step_multiplier_index(ladder: list[float], value: float) -> int:
+    """Return the closest multiplier index, using log distance."""
+
+    return min(
+        range(len(ladder)),
+        key=lambda index: abs(np.log(ladder[index]) - np.log(value)),
+    )
+
+
+def neighbor_window_indices(center_index: int, ladder_length: int) -> list[int]:
+    """Return old multiplier plus adjacent larger/smaller ladder entries."""
+
+    lo = max(0, center_index - 1)
+    hi = min(ladder_length - 1, center_index + 1)
+    return list(range(lo, hi + 1))
+
+
+def local_step_multiplier_window(
+    *,
+    include_extra_shrinks: bool,
+    last_step_multiplier: float | None,
+    step_sweep_start_multiplier: float,
+) -> list[float]:
+    """Return the first local bracket for a neighbor sweep."""
+
+    ladder = effective_step_multipliers(include_extra_shrinks=include_extra_shrinks)
+    center = last_step_multiplier if last_step_multiplier is not None else step_sweep_start_multiplier
+    center_index = nearest_step_multiplier_index(ladder, center)
+    return [ladder[index] for index in neighbor_window_indices(center_index, len(ladder))]
+
+
+def step_multipliers_for_iteration(
+    *,
+    iteration: int,
+    include_extra_shrinks: bool,
+    step_sweep_initial_iterations: int,
+    step_sweep_period: int,
+    step_sweep_mode: str,
+    step_sweep_start_multiplier: float,
+    last_step_multiplier: float | None,
+) -> tuple[list[float], str, bool]:
+    """Choose a full bracket, neighbor bracket, or one trusted multiplier."""
+
+    scheduled_sweep = should_sweep_steps(
+        iteration,
+        step_sweep_initial_iterations=step_sweep_initial_iterations,
+        step_sweep_period=step_sweep_period,
+    )
+    if scheduled_sweep:
+        if step_sweep_mode == "neighbor":
+            return (
+                local_step_multiplier_window(
+                    include_extra_shrinks=include_extra_shrinks,
+                    last_step_multiplier=last_step_multiplier,
+                    step_sweep_start_multiplier=step_sweep_start_multiplier,
+                ),
+                "neighbor_sweep",
+                True,
+            )
+        return effective_step_multipliers(include_extra_shrinks=include_extra_shrinks), "sweep", True
+    if last_step_multiplier is not None:
+        return [last_step_multiplier], "single", False
+    return [1.0], "single_default", False
 
 
 def candidate_with_components(
@@ -312,6 +393,126 @@ def component_history_fields(components: dict[str, float]) -> dict[str, float]:
     }
 
 
+def evaluate_step_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    direction: VariableDict,
+    search_scale: float,
+    step_multipliers: list[float],
+    base_objective: float,
+    base_components: dict[str, float],
+    include_extra_shrinks: bool,
+    iteration: int,
+    step_search_mode: str,
+    step_multiplier_indices: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Evaluate one line-search bracket or a single trusted step."""
+
+    if step_multiplier_indices is None:
+        ladder = effective_step_multipliers(include_extra_shrinks=include_extra_shrinks)
+        step_multiplier_indices = [
+            nearest_step_multiplier_index(ladder, multiplier)
+            for multiplier in step_multipliers
+        ]
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+    for step, multiplier, multiplier_index in zip(
+        line_search_steps(search_scale, step_multipliers),
+        step_multipliers,
+        step_multiplier_indices,
+    ):
+        summary, candidate, evaluation = candidate_with_components(
+            model,
+            variables,
+            direction,
+            step,
+            base_objective,
+            base_components,
+        )
+        summary["iteration"] = iteration
+        summary["step_multiplier"] = float(multiplier)
+        summary["step_multiplier_index"] = int(multiplier_index)
+        summary["step_search_mode"] = step_search_mode
+        candidates.append(summary)
+        candidate_variables.append(candidate)
+        candidate_evaluations.append(evaluation)
+    return candidates, candidate_variables, candidate_evaluations
+
+
+def evaluate_neighbor_step_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    direction: VariableDict,
+    search_scale: float,
+    initial_multipliers: list[float],
+    base_objective: float,
+    base_components: dict[str, float],
+    include_extra_shrinks: bool,
+    iteration: int,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Walk the multiplier ladder until the best accepted candidate is interior."""
+
+    ladder = effective_step_multipliers(include_extra_shrinks=include_extra_shrinks)
+    current_indices = list(
+        dict.fromkeys(
+            nearest_step_multiplier_index(ladder, multiplier)
+            for multiplier in initial_multipliers
+        )
+    )
+    evaluated = [False] * len(ladder)
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+
+    while True:
+        new_indices = [index for index in current_indices if not evaluated[index]]
+        if new_indices:
+            new_candidates, new_variables, new_evaluations = evaluate_step_candidates(
+                model=model,
+                variables=variables,
+                direction=direction,
+                search_scale=search_scale,
+                step_multipliers=[ladder[index] for index in new_indices],
+                base_objective=base_objective,
+                base_components=base_components,
+                include_extra_shrinks=include_extra_shrinks,
+                iteration=iteration,
+                step_search_mode="neighbor_sweep",
+                step_multiplier_indices=new_indices,
+            )
+            candidates.extend(new_candidates)
+            candidate_variables.extend(new_variables)
+            candidate_evaluations.extend(new_evaluations)
+            for index in new_indices:
+                evaluated[index] = True
+
+        current_candidates = [
+            candidate
+            for candidate in candidates
+            if int(candidate["step_multiplier_index"]) in current_indices
+        ]
+        accepted = [candidate for candidate in current_candidates if candidate["accepted"]]
+        if not accepted:
+            break
+
+        best = min(accepted, key=lambda candidate: float(candidate["objective"]))
+        best_index = int(best["step_multiplier_index"])
+        if best_index == current_indices[0] and best_index > 0:
+            current_indices = neighbor_window_indices(best_index, len(ladder))
+        elif best_index == current_indices[-1] and best_index < len(ladder) - 1:
+            current_indices = neighbor_window_indices(best_index, len(ladder))
+        else:
+            break
+
+        if all(evaluated[index] for index in current_indices):
+            break
+
+    return candidates, candidate_variables, candidate_evaluations
+
+
 def run_optimizer(
     *,
     mode: str,
@@ -322,13 +523,18 @@ def run_optimizer(
     initial_step_scale: float,
     rowband_use_natural_step: bool,
     include_extra_shrinks: bool,
+    step_sweep_initial_iterations: int,
+    step_sweep_period: int,
+    step_sweep_mode: str,
+    step_sweep_start_multiplier: float,
+    recovery_step_sweep: bool,
     constraint_weight: float,
 ) -> dict[str, Any]:
     """Run a saved-state optimizer comparison.
 
     ``vanilla``, ``raw_pq``, and ``raw_all`` modes are controls.  ``rowband_pq``
-    reproduces the pushed recommendation.  ``rowband_all`` tests the same
-    measured-scale idea across every optimizer variable.
+    reproduces the older P/Q-only experiment.  ``rowband_all`` is the current
+    recommended all-variable row-band setup.
 
     The objective and acceptance logic are deliberately unchanged across modes
     so the resulting JSON/CSV files differ only by the direction family and the
@@ -337,6 +543,14 @@ def run_optimizer(
 
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
+    if step_sweep_initial_iterations < 0:
+        raise ValueError("step_sweep_initial_iterations must be nonnegative")
+    if step_sweep_period < 1:
+        raise ValueError("step_sweep_period must be positive")
+    if step_sweep_mode not in ("full", "neighbor"):
+        raise ValueError("step_sweep_mode must be 'full' or 'neighbor'")
+    if step_sweep_start_multiplier <= 0.0 or not np.isfinite(step_sweep_start_multiplier):
+        raise ValueError("step_sweep_start_multiplier must be positive and finite")
 
     model = RankOptimizationModel(DATA_PATH, constraint_weight=constraint_weight)
     variables = load_state(state_path)
@@ -352,6 +566,7 @@ def run_optimizer(
     initial_residuals = residual_rms_summary(model, current_evaluation)
     initial_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     step_scale = initial_step_scale
+    last_step_multiplier: float | None = None
 
     history: list[dict[str, float | int | str]] = []
     candidate_history: list[dict[str, Any]] = []
@@ -382,28 +597,63 @@ def run_optimizer(
             # collapsing back to the tiny vanilla gradient step size.
             search_scale = direction_norm_before_normalization
 
-        # Trial points follow the same discipline as the vanilla optimizer:
-        # update coefficients, retract/refit, evaluate residuals, reject gauge
-        # drift, then choose the lowest accepted objective.
-        candidates: list[dict[str, Any]] = []
-        candidate_variables: list[VariableDict] = []
-        candidate_evaluations: list[Evaluation] = []
-        for step in line_search_steps(search_scale, include_extra_shrinks=include_extra_shrinks):
-            summary, candidate, evaluation = candidate_with_components(
-                model,
-                variables,
-                direction,
-                step,
-                base_objective,
-                base_components,
+        step_multipliers, step_search_mode, scheduled_sweep = step_multipliers_for_iteration(
+            iteration=iteration,
+            include_extra_shrinks=include_extra_shrinks,
+            step_sweep_initial_iterations=step_sweep_initial_iterations,
+            step_sweep_period=step_sweep_period,
+            step_sweep_mode=step_sweep_mode,
+            step_sweep_start_multiplier=step_sweep_start_multiplier,
+            last_step_multiplier=last_step_multiplier,
+        )
+        if step_search_mode == "neighbor_sweep":
+            candidates, candidate_variables, candidate_evaluations = evaluate_neighbor_step_candidates(
+                model=model,
+                variables=variables,
+                direction=direction,
+                search_scale=search_scale,
+                initial_multipliers=step_multipliers,
+                base_objective=base_objective,
+                base_components=base_components,
+                include_extra_shrinks=include_extra_shrinks,
+                iteration=iteration,
             )
-            summary["iteration"] = iteration
-            candidates.append(summary)
-            candidate_variables.append(candidate)
-            candidate_evaluations.append(evaluation)
+        else:
+            candidates, candidate_variables, candidate_evaluations = evaluate_step_candidates(
+                model=model,
+                variables=variables,
+                direction=direction,
+                search_scale=search_scale,
+                step_multipliers=step_multipliers,
+                base_objective=base_objective,
+                base_components=base_components,
+                include_extra_shrinks=include_extra_shrinks,
+                iteration=iteration,
+                step_search_mode=step_search_mode,
+            )
+        iteration_trial_count = len(candidates)
         candidate_history.extend(candidates)
 
         accepted_index, accepted_variables = choose_best_candidate(candidates, candidate_variables)
+        if accepted_index is None and not scheduled_sweep and recovery_step_sweep:
+            recovery_candidates, recovery_variables, recovery_evaluations = evaluate_step_candidates(
+                model=model,
+                variables=variables,
+                direction=direction,
+                search_scale=search_scale,
+                step_multipliers=effective_step_multipliers(include_extra_shrinks=include_extra_shrinks),
+                base_objective=base_objective,
+                base_components=base_components,
+                include_extra_shrinks=include_extra_shrinks,
+                iteration=iteration,
+                step_search_mode="recovery_sweep",
+            )
+            iteration_trial_count += len(recovery_candidates)
+            candidate_history.extend(recovery_candidates)
+            candidates = recovery_candidates
+            candidate_variables = recovery_variables
+            candidate_evaluations = recovery_evaluations
+            accepted_index, accepted_variables = choose_best_candidate(candidates, candidate_variables)
         if accepted_index is None or accepted_variables is None:
             stop_reason = "no line-search candidate reduced the objective while preserving gauges"
             break
@@ -415,6 +665,7 @@ def run_optimizer(
         # row-band mode this mainly matters when ``--fixed-rowband-step-scale``
         # is used; otherwise the natural row-band norm resets it each iteration.
         step_scale = float(best["step"])
+        last_step_multiplier = float(best["step_multiplier"])
         residuals = residual_rms_summary(model, current_evaluation)
         gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
         components = best["objective_components"]
@@ -431,6 +682,9 @@ def run_optimizer(
         )
         row["mode"] = mode
         row["search_step_scale"] = float(search_scale)
+        row["step_search_mode"] = str(best["step_search_mode"])
+        row["accepted_step_multiplier"] = float(best["step_multiplier"])
+        row["line_search_trial_count"] = int(iteration_trial_count)
         row.update(component_history_fields(components))
         history.append(row)
         print(
@@ -438,6 +692,9 @@ def run_optimizer(
             f"J={best['objective']:.12e} "
             f"dJ={best['objective_change']:.3e} "
             f"step={best['step']:.3e} "
+            f"mult={best['step_multiplier']:.3g} "
+            f"search={best['step_search_mode']} "
+            f"trials={iteration_trial_count} "
             f"|d_raw|={direction_norm_before_normalization:.3e} "
             f"div_loss={components['divergence']:.3e} "
             f"curl_loss={components['curl']:.3e} "
@@ -483,8 +740,14 @@ def run_optimizer(
         "initial_step_scale": initial_step_scale,
         "rowband_use_natural_step": rowband_use_natural_step,
         "include_extra_shrinks": include_extra_shrinks,
-        "line_search_step_multipliers": list(STEP_MULTIPLIERS)
-        + (EXTRA_SHRINKS if include_extra_shrinks else []),
+        "line_search_step_multipliers": effective_step_multipliers(
+            include_extra_shrinks=include_extra_shrinks
+        ),
+        "step_sweep_initial_iterations": step_sweep_initial_iterations,
+        "step_sweep_period": step_sweep_period,
+        "step_sweep_mode": step_sweep_mode,
+        "step_sweep_start_multiplier": step_sweep_start_multiplier,
+        "recovery_step_sweep": recovery_step_sweep,
         "max_iterations": max_iterations,
         "min_objective_decrease": MIN_OBJECTIVE_DECREASE,
         "gauge_tolerance": GAUGE_TOLERANCE,
@@ -506,23 +769,57 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     parser.add_argument(
         "--mode",
         choices=("vanilla", "raw_pq", "raw_all", "rowband_pq", "rowband_all"),
-        default="rowband_pq",
+        default="rowband_all",
     )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--pq-diagnostic", type=Path, default=DEFAULT_PQ_DIAGNOSTIC)
-    parser.add_argument("-n", "--max-iterations", type=int, default=10)
+    parser.add_argument("--pq-diagnostic", type=Path, default=DEFAULT_ROWBAND_DIAGNOSTIC)
+    parser.add_argument("-n", "--max-iterations", type=int, default=30)
     parser.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX)
     parser.add_argument("--initial-step-scale", type=float, default=INITIAL_STEP_SCALE)
-    parser.add_argument("--constraint-weight", type=float, default=CONSTRAINT_WEIGHT)
+    parser.add_argument("--constraint-weight", type=float, default=DEFAULT_CONSTRAINT_WEIGHT)
     parser.add_argument(
         "--fixed-rowband-step-scale",
         action="store_true",
         help="use --initial-step-scale for rowband mode instead of the raw rowband direction norm",
     )
     parser.add_argument(
+        "--include-extra-shrinks",
+        action="store_true",
+        help="append exploratory shrink multipliers below the original seven-point ladder",
+    )
+    parser.add_argument(
         "--no-extra-shrinks",
         action="store_true",
-        help="only use the original seven vanilla line-search multipliers",
+        help="deprecated compatibility flag; extra shrinks are already off by default",
+    )
+    parser.add_argument(
+        "--step-sweep-initial-iterations",
+        type=int,
+        default=5,
+        help="number of initial iterations that search around the step multiplier",
+    )
+    parser.add_argument(
+        "--step-sweep-period",
+        type=int,
+        default=5,
+        help="after warmup, search around the step multiplier every N iterations",
+    )
+    parser.add_argument(
+        "--step-sweep-mode",
+        choices=("full", "neighbor"),
+        default="neighbor",
+        help="use the full ladder or the local neighbor-walk ladder on scheduled sweeps",
+    )
+    parser.add_argument(
+        "--step-sweep-start-multiplier",
+        type=float,
+        default=1.0,
+        help="starting multiplier for the first neighbor sweep before any accepted step exists",
+    )
+    parser.add_argument(
+        "--no-recovery-step-sweep",
+        action="store_true",
+        help="stop instead of trying a full ladder sweep when an unscheduled single step fails",
     )
     return parser.parse_args(argv)
 
@@ -540,7 +837,12 @@ def main(argv: list[str] | None = None) -> int:
         output_prefix=args.output_prefix,
         initial_step_scale=args.initial_step_scale,
         rowband_use_natural_step=not args.fixed_rowband_step_scale,
-        include_extra_shrinks=not args.no_extra_shrinks,
+        include_extra_shrinks=args.include_extra_shrinks and not args.no_extra_shrinks,
+        step_sweep_initial_iterations=args.step_sweep_initial_iterations,
+        step_sweep_period=args.step_sweep_period,
+        step_sweep_mode=args.step_sweep_mode,
+        step_sweep_start_multiplier=args.step_sweep_start_multiplier,
+        recovery_step_sweep=not args.no_recovery_step_sweep,
         constraint_weight=args.constraint_weight,
     )
     paths = output_paths(args.output_prefix)

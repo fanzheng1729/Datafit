@@ -52,6 +52,32 @@ matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_ro
 `UseParallel` defaults to `false`; the warmed 4-worker test was slightly slower
 than serial for the current 7-candidate line search.
 
+The Python saved-state row-band optimizer is
+`optimize_rank_factors_pq_rowband.py`. Its current defaults mirror the
+recommended all-variable setup:
+
+```powershell
+python optimize_rank_factors_pq_rowband.py
+```
+
+Defaults are `--mode rowband_all`, `--constraint-weight 0.007`,
+`--max-iterations 30`, `--state compare_curl_trust_rank_optimization_state.npz`,
+`--pq-diagnostic all_variable_rowband_step_scaling_diagnostic_results.json`,
+extra shrinks off, and the neighbor scheduled sweep
+`--step-sweep-initial-iterations 5 --step-sweep-period 5
+--step-sweep-mode neighbor`. Use `--include-extra-shrinks` only for the
+exploratory smaller-step branch; the 30-step and 60-step comparisons favored
+keeping it off.
+
+Historical P/Q-only comparisons should pass their older mode, diagnostic, and
+constraint weight explicitly, for example:
+
+```powershell
+python optimize_rank_factors_pq_rowband.py --mode rowband_pq `
+  --constraint-weight 0.0003 `
+  --pq-diagnostic pq_support_step_scaling_diagnostic_results.json
+```
+
 ## Reading MATLAB Data From Python
 
 `data.mat` is a MATLAB v5 MAT file. It is not a MATLAB `-v7.3` HDF5 file. The
