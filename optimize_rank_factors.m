@@ -722,12 +722,14 @@ function fixed = build_fixed_velocity(data, model)
 % Reconstruct the semi-analytic far-field velocity correction from the stored
 % angular spline coefficients and polar derivative tables.
 
-rat = double(data.rec(7));
 xycoe = XYcoef(double(data.gx1(:)), double(data.gx2(:)), double(data.alpha_b), data.Chi20, data.AG);
 psi1 = Deri_Psi1(numel(data.gx1), numel(data.gx2), double(data.p_ag_coe), data.BS1d_large, 2, xycoe);
 psi1 = Cell_2double(psi1);
+
+rat = double(data.rec(7));
 n1 = numel(model.x1);
 n2 = numel(model.x2);
+
 fixed = struct();
 fixed.u1 = -rat * psi1(1:n1, 1:n2, 1, 2);
 fixed.u1x1 = -rat * psi1(1:n1, 1:n2, 2, 2);
@@ -852,10 +854,10 @@ cache.right = core.y0 * q;
 cache.right_x2 = core.y1 * q;
 cache.s = s(:);
 [cache.value, cache.x1, cache.x2] = ...
-    synthesize_triplet(cache.left, cache.left_x1, cache.right, cache.right_x2, s);
+    value_gradient(cache.left, cache.left_x1, cache.right, cache.right_x2, s);
 end
 
-function [value, value_x1, value_x2] = synthesize_triplet(left, left_x1, right, right_x2, s)
+function [value, value_x1, value_x2] = value_gradient(left, left_x1, right, right_x2, s)
 % Matrix form of left*diag(s)*right' plus the two first derivatives.
 
 weighted_left = left .* reshape(s, 1, []);

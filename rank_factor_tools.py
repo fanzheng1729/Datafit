@@ -36,7 +36,7 @@ def synthesize(left: np.ndarray, right: np.ndarray, singular_values: np.ndarray)
     return (left * singular_values[None, :]) @ right.T
 
 
-def synthesize_triplet(
+def value_gradient(
     left: np.ndarray,
     left_x1: np.ndarray,
     right: np.ndarray,

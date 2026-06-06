@@ -24,7 +24,7 @@ import numpy as np
 import runfit
 from rank_factor_tools import (
     retract_and_refit,
-    synthesize_triplet,
+    value_gradient,
     weighted_orthonormality_error,
 )
 
@@ -298,7 +298,6 @@ class RankOptimizationModel:
         divergence residuals to match the saved MATLAB fit.
         """
 
-        rat = float(np.asarray(data["rec"])[6])
         polar_coeff = runfit.xycoef(
             np.asarray(data["gx1"], dtype=float),
             np.asarray(data["gx2"], dtype=float),
@@ -313,6 +312,7 @@ class RankOptimizationModel:
             polar_coeff,
             order=2,
         )
+        rat = float(np.asarray(data["rec"])[6])
         n1 = self.x1.size
         n2 = self.x2.size
         return {
@@ -337,7 +337,7 @@ class RankOptimizationModel:
         left_x1 = core.x1 @ p
         right = core.y0 @ q
         right_x2 = core.y1 @ q
-        value, x1, x2 = synthesize_triplet(left, left_x1, right, right_x2, s)
+        value, x1, x2 = value_gradient(left, left_x1, right, right_x2, s)
         return {
             "left": left,
             "left_x1": left_x1,
