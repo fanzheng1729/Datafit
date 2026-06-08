@@ -11,6 +11,10 @@ Numerics.txt
 *_summary.json
 *_diagnostic_results.json
 *_state.npz
+*_state.mat
+*_wrapper.ps1
+*_wrapper_pid.txt
+*_wrapper_status.txt
 gradient_direction_sign_test.json
 gradient_check_results.json
 rank_optimization_stop_inspection.json

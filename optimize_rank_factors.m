@@ -485,6 +485,9 @@ function blocks = target_blocks_for_mode(mode, diagnostic)
 mode = string(mode);
 if mode == "raw_all" || mode == "rowband_all"
     blocks = target_blocks_from_diagnostic(diagnostic);
+    if ~any(blocks == "rat")
+        blocks = [blocks, "rat"];
+    end
 else
     blocks = pq_target_blocks();
 end
@@ -524,6 +527,10 @@ variables = struct();
 for keyName = model.variableKeys
     key = char(keyName);
     if ~isfield(data, key)
+        if keyName == "rat"
+            variables.(key) = model.variables.(key);
+            continue
+        end
         error("State file %s is missing variable %s.", path, key);
     end
     value = double(data.(key));
@@ -576,6 +583,15 @@ for blockName = targetBlocks
     block = char(blockName);
     blockGradient = gradient.(block);
     blockDirection = zeros(size(blockGradient));
+    if ~isfield(diagnostic.block_results, block)
+        if numel(blockGradient) == 1
+            safeStep = fallback_scalar_safe_step(diagnostic);
+            blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, 1, safeStep);
+            direction.(block) = blockDirection;
+            continue
+        end
+        error("Row-band diagnostic does not contain block %s.", block);
+    end
     groups = diagnostic.block_results.(block).groups;
     for k = 1:numel(groups)
         group = groups(k);
@@ -587,6 +603,29 @@ for blockName = targetBlocks
         blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, rows, safeStep);
     end
     direction.(block) = blockDirection;
+end
+end
+
+function safeStep = fallback_scalar_safe_step(diagnostic)
+% Reuse the safest measured scalar rate step for new scalar variables.
+
+steps = [];
+for name = ["cl", "cw"]
+    key = char(name);
+    if isfield(diagnostic.block_results, key)
+        groups = diagnostic.block_results.(key).groups;
+        for k = 1:numel(groups)
+            step = group_safe_step(groups(k));
+            if ~isempty(step) && step > 0
+                steps(end + 1) = step; %#ok<AGROW>
+            end
+        end
+    end
+end
+if isempty(steps)
+    safeStep = 1.0e-7;
+else
+    safeStep = min(steps);
 end
 end
 
@@ -672,15 +711,17 @@ model.cores = [
 ];
 model.coreNames = string({model.cores.name});
 
-% The far-field stream-function piece is not optimized; it is rebuilt once and
-% added to the finite velocity factors during evaluation.
-model.fixedVelocity = build_fixed_velocity(data, model);
+% The far-field stream-function piece is linear in the scalar coefficient rat.
+% Store the unit-rat basis once and let the optimizer move rat with cl/cw.
+model.farfieldVelocity = build_farfield_velocity_basis(data, model);
+rat = double(data.rec(7));
 cl = 4.0 * double(data.vx1(1, 1)) / double(data.wx1(1, 1));
 cw = double(data.Vel.u1dx1(1, 1)) + cl / 2.0;
 
 variables = struct();
 variables.cl = cl;
 variables.cw = cw;
+variables.rat = rat;
 for k = 1:numel(model.cores)
     core = model.cores(k);
     variables.(core.pKey) = core.p;
@@ -688,7 +729,7 @@ for k = 1:numel(model.cores)
     variables.(core.sKey) = core.s;
 end
 model.arrayKeys = build_array_keys(model);
-model.variableKeys = [model.arrayKeys, "cl", "cw"];
+model.variableKeys = [model.arrayKeys, "cl", "cw", "rat"];
 
 % Start from a normalized chart. Retraction sorts singular values and makes
 % the left/right factors orthonormal under the grid inner product.
@@ -718,7 +759,7 @@ for k = 1:numel(model.cores)
 end
 end
 
-function fixed = build_fixed_velocity(data, model)
+function fixed = build_farfield_velocity_basis(data, model)
 % Reconstruct the semi-analytic far-field velocity correction from the stored
 % angular spline coefficients and polar derivative tables.
 
@@ -726,17 +767,16 @@ xycoe = XYcoef(double(data.gx1(:)), double(data.gx2(:)), double(data.alpha_b), d
 psi1 = Deri_Psi1(numel(data.gx1), numel(data.gx2), double(data.p_ag_coe), data.BS1d_large, 2, xycoe);
 psi1 = Cell_2double(psi1);
 
-rat = double(data.rec(7));
 n1 = numel(model.x1);
 n2 = numel(model.x2);
 
 fixed = struct();
-fixed.u1 = -rat * psi1(1:n1, 1:n2, 1, 2);
-fixed.u1x1 = -rat * psi1(1:n1, 1:n2, 2, 2);
-fixed.u1x2 = -rat * psi1(1:n1, 1:n2, 1, 3);
-fixed.u2 = rat * psi1(1:n1, 1:n2, 2, 1);
-fixed.u2x1 = rat * psi1(1:n1, 1:n2, 3, 1);
-fixed.u2x2 = rat * psi1(1:n1, 1:n2, 2, 2);
+fixed.u1 = -psi1(1:n1, 1:n2, 1, 2);
+fixed.u1x1 = -psi1(1:n1, 1:n2, 2, 2);
+fixed.u1x2 = -psi1(1:n1, 1:n2, 1, 3);
+fixed.u2 = psi1(1:n1, 1:n2, 2, 1);
+fixed.u2x1 = psi1(1:n1, 1:n2, 3, 1);
+fixed.u2x2 = psi1(1:n1, 1:n2, 2, 2);
 end
 
 function core = build_rank_core(name, values, x1, x2, parity, epsSVD)
@@ -816,12 +856,13 @@ fields.omega_x2 = model.profileFactor .* omega_core.x2 + model.profileFactorX2 .
 fields.zeta = model.profileFactor .* zeta_core.value;
 fields.zeta_x1 = model.profileFactor .* zeta_core.x1 + model.profileFactorX1 .* zeta_core.value;
 fields.zeta_x2 = model.profileFactor .* zeta_core.x2 + model.profileFactorX2 .* zeta_core.value;
-fields.u1 = model.u1Factor .* u1_core.value + model.fixedVelocity.u1;
-fields.u1x1 = model.u1Factor .* u1_core.x1 + model.u1FactorX1 .* u1_core.value + model.fixedVelocity.u1x1;
-fields.u1x2 = model.u1Factor .* u1_core.x2 + model.fixedVelocity.u1x2;
-fields.u2 = model.u2Factor .* u2_core.value + model.fixedVelocity.u2;
-fields.u2x1 = model.u2Factor .* u2_core.x1 + model.fixedVelocity.u2x1;
-fields.u2x2 = model.u2Factor .* u2_core.x2 + model.u2FactorX2 .* u2_core.value + model.fixedVelocity.u2x2;
+rat = variables.rat;
+fields.u1 = model.u1Factor .* u1_core.value + rat * model.farfieldVelocity.u1;
+fields.u1x1 = model.u1Factor .* u1_core.x1 + model.u1FactorX1 .* u1_core.value + rat * model.farfieldVelocity.u1x1;
+fields.u1x2 = model.u1Factor .* u1_core.x2 + rat * model.farfieldVelocity.u1x2;
+fields.u2 = model.u2Factor .* u2_core.value + rat * model.farfieldVelocity.u2;
+fields.u2x1 = model.u2Factor .* u2_core.x1 + rat * model.farfieldVelocity.u2x1;
+fields.u2x2 = model.u2Factor .* u2_core.x2 + model.u2FactorX2 .* u2_core.value + rat * model.farfieldVelocity.u2x2;
 
 cl = variables.cl;
 cw = variables.cw;
@@ -942,7 +983,7 @@ lam.curl = model.constraintWeight * residuals.curl ./ (model.scales.curl ^ 2 * n
 end
 
 function gradient = analytic_gradient(model, variables, evaluation)
-% Analytic gradient of J with respect to every P/Q/S factor plus cl and cw.
+% Analytic gradient of J with respect to every P/Q/S factor plus cl, cw, rat.
 
 if nargin < 3
     evaluation = [];
@@ -957,6 +998,7 @@ gradient = zero_like_variables(variables, model.variableKeys);
 gradient.cl = sum(lam.fomega .* (-(model.x1Col .* fields.omega_x1 + model.x2Row .* fields.omega_x2)), "all") ...
     + sum(lam.fzeta .* (-(model.x1Col .* fields.zeta_x1 + model.x2Row .* fields.zeta_x2)), "all");
 gradient.cw = sum(lam.fomega .* fields.omega, "all") + sum(lam.fzeta .* (2.0 * fields.zeta), "all");
+gradient.rat = farfield_rat_gradient(model, fg);
 
 % Push field adjoints through the damping factors and the spline/SVD chart.
 gradient = add_rank_gradient(model, gradient, "omega", fg.omega.value, fg.omega.x1, fg.omega.x2, ...
@@ -967,6 +1009,18 @@ gradient = add_rank_gradient(model, gradient, "u1", fg.u1.value, fg.u1.x1, fg.u1
     evaluation.coreCache.u1, model.u1Factor, model.u1FactorX1, zeros(size(model.u1Factor)));
 gradient = add_rank_gradient(model, gradient, "u2", fg.u2.value, fg.u2.x1, fg.u2.x2, ...
     evaluation.coreCache.u2, model.u2Factor, zeros(size(model.u2Factor)), model.u2FactorX2);
+end
+
+function value = farfield_rat_gradient(model, fg)
+% Contract field adjoints with the unit-rat far-field velocity basis.
+
+basis = model.farfieldVelocity;
+value = sum(fg.u1.value .* basis.u1, "all") ...
+    + sum(fg.u1.x1 .* basis.u1x1, "all") ...
+    + sum(fg.u1.x2 .* basis.u1x2, "all") ...
+    + sum(fg.u2.value .* basis.u2, "all") ...
+    + sum(fg.u2.x1 .* basis.u2x1, "all") ...
+    + sum(fg.u2.x2 .* basis.u2x2, "all");
 end
 
 function fg = field_gradient(model, variables, evaluation)

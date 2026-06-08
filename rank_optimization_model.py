@@ -37,7 +37,7 @@ DATA_PATH = Path(__file__).with_name("data.mat")
 # value came from the P/Q gradient-balance sweep: it is small enough for the
 # fitted equations to move, but still kept divergence and curl nonincreasing in
 # the recorded 30-step run.
-CONSTRAINT_WEIGHT = 3.0e-4
+CONSTRAINT_WEIGHT = 0.007
 
 
 VariableDict = dict[str, np.ndarray | float]
@@ -239,8 +239,8 @@ class RankOptimizationModel:
         )
 
         # The near-field velocity factors use one-dimensional damping weights.
-        # The far-field velocity is not optimized; it is reconstructed once in
-        # ``_build_fixed_velocity`` and then added to every evaluation.
+        # The far-field velocity is linear in the scalar coefficient ``rat``;
+        # store the unit-rat basis once and optimize the scalar with cl/cw.
         factor0_u1 = 1.0 + self.x1_col**2
         self.u1_factor = factor0_u1**0.25
         self.u1_factor_x1 = 0.5 * self.x1_col * self.u1_factor / factor0_u1
@@ -258,7 +258,8 @@ class RankOptimizationModel:
         ]
         self.core_by_name = {core.name: core for core in self.cores}
 
-        self.fixed_velocity = self._build_fixed_velocity(data)
+        self.farfield_velocity = self._build_farfield_velocity_basis(data)
+        rat = float(np.asarray(data["rec"])[6])
         omega_x1 = np.asarray(data["wx1"], dtype=float)
         zeta_x1 = np.asarray(data["vx1"], dtype=float)
         # The two scalar rates are initialized from the origin identities used
@@ -266,7 +267,7 @@ class RankOptimizationModel:
         cl = float(4.0 * zeta_x1[0, 0] / omega_x1[0, 0])
         cw = float(vel["u1dx1"][0, 0] + cl / 2.0)
 
-        self.variables: VariableDict = {"cl": cl, "cw": cw}
+        self.variables: VariableDict = {"cl": cl, "cw": cw, "rat": rat}
         for core in self.cores:
             self.variables[core.p_key] = core.p.copy()
             self.variables[core.q_key] = core.q.copy()
@@ -287,10 +288,19 @@ class RankOptimizationModel:
         return keys
 
     def variable_keys(self) -> list[str]:
-        return self.array_keys() + ["cl", "cw"]
+        return self.array_keys() + ["cl", "cw", "rat"]
 
-    def _build_fixed_velocity(self, data: dict[str, Any]) -> dict[str, np.ndarray]:
-        """Reconstruct the non-optimized far-field velocity contribution.
+    def complete_variables(self, variables: VariableDict) -> VariableDict:
+        """Fill new variables when loading older saved states."""
+
+        out = copy_variables(variables)
+        for key, value in self.variables.items():
+            if key not in out:
+                out[key] = value.copy() if isinstance(value, np.ndarray) else float(value)
+        return out
+
+    def _build_farfield_velocity_basis(self, data: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Reconstruct the unit-rat far-field velocity contribution.
 
         The optimized ``u1``/``u2`` cores cover only the near-field pieces.  The
         saved streamfunction correction ``Psi1`` contributes a fixed velocity
@@ -312,16 +322,15 @@ class RankOptimizationModel:
             polar_coeff,
             order=2,
         )
-        rat = float(np.asarray(data["rec"])[6])
         n1 = self.x1.size
         n2 = self.x2.size
         return {
-            "u1": -rat * psi1[(0, 1)][:n1, :n2],
-            "u1x1": -rat * psi1[(1, 1)][:n1, :n2],
-            "u1x2": -rat * psi1[(0, 2)][:n1, :n2],
-            "u2": rat * psi1[(1, 0)][:n1, :n2],
-            "u2x1": rat * psi1[(2, 0)][:n1, :n2],
-            "u2x2": rat * psi1[(1, 1)][:n1, :n2],
+            "u1": -psi1[(0, 1)][:n1, :n2],
+            "u1x1": -psi1[(1, 1)][:n1, :n2],
+            "u1x2": -psi1[(0, 2)][:n1, :n2],
+            "u2": psi1[(1, 0)][:n1, :n2],
+            "u2x1": psi1[(2, 0)][:n1, :n2],
+            "u2x2": psi1[(1, 1)][:n1, :n2],
         }
 
     def _core_eval(self, core: RankCore, variables: VariableDict) -> dict[str, np.ndarray]:
@@ -368,21 +377,22 @@ class RankOptimizationModel:
         zeta_x1 = self.profile_factor * zeta_core["x1"] + self.profile_factor_x1 * zeta_core["value"]
         zeta_x2 = self.profile_factor * zeta_core["x2"] + self.profile_factor_x2 * zeta_core["value"]
 
-        # Velocity is split into optimized near-field rank cores and a fixed
-        # far-field streamfunction-derived piece.
-        u1 = self.u1_factor * u1_core["value"] + self.fixed_velocity["u1"]
+        # Velocity is split into optimized near-field rank cores and a
+        # rat-scaled far-field streamfunction-derived piece.
+        rat = float(variables["rat"])
+        u1 = self.u1_factor * u1_core["value"] + rat * self.farfield_velocity["u1"]
         u1x1 = (
             self.u1_factor * u1_core["x1"]
             + self.u1_factor_x1 * u1_core["value"]
-            + self.fixed_velocity["u1x1"]
+            + rat * self.farfield_velocity["u1x1"]
         )
-        u1x2 = self.u1_factor * u1_core["x2"] + self.fixed_velocity["u1x2"]
-        u2 = self.u2_factor * u2_core["value"] + self.fixed_velocity["u2"]
-        u2x1 = self.u2_factor * u2_core["x1"] + self.fixed_velocity["u2x1"]
+        u1x2 = self.u1_factor * u1_core["x2"] + rat * self.farfield_velocity["u1x2"]
+        u2 = self.u2_factor * u2_core["value"] + rat * self.farfield_velocity["u2"]
+        u2x1 = self.u2_factor * u2_core["x1"] + rat * self.farfield_velocity["u2x1"]
         u2x2 = (
             self.u2_factor * u2_core["x2"]
             + self.u2_factor_x2 * u2_core["value"]
-            + self.fixed_velocity["u2x2"]
+            + rat * self.farfield_velocity["u2x2"]
         )
 
         cl = float(variables["cl"])
@@ -483,14 +493,15 @@ class RankOptimizationModel:
         a1 = cl * self.x1_col + fields["u1"]
         a2 = cl * self.x2_row + fields["u2"]
 
-        # ``cl`` and ``cw`` enter only the two profile residuals, so their
-        # gradients are direct contractions of those residual adjoints.
+        # ``cl`` and ``cw`` enter only the two profile residuals. ``rat`` enters
+        # through the far-field velocity basis.
         gradient: VariableDict = {
             "cl": float(
                 np.sum(lam["fomega"] * (-(self.x1_col * fields["omega_x1"] + self.x2_row * fields["omega_x2"])))
                 + np.sum(lam["fzeta"] * (-(self.x1_col * fields["zeta_x1"] + self.x2_row * fields["zeta_x2"])))
             ),
             "cw": float(np.sum(lam["fomega"] * fields["omega"]) + np.sum(lam["fzeta"] * (2.0 * fields["zeta"]))),
+            "rat": self._farfield_rat_gradient(field_gradients),
         }
 
         self._add_rank_gradient(
@@ -510,6 +521,21 @@ class RankOptimizationModel:
             self.u2_factor, np.zeros_like(self.u2_factor), self.u2_factor_x2
         )
         return gradient
+
+    def _farfield_rat_gradient(self, field_gradients: dict[str, Any]) -> float:
+        """Contract field adjoints with the unit-rat far-field velocity basis."""
+
+        u1_value, u1_x1, u1_x2 = field_gradients["u1"]
+        u2_value, u2_x1, u2_x2 = field_gradients["u2"]
+        basis = self.farfield_velocity
+        return float(
+            np.sum(u1_value * basis["u1"])
+            + np.sum(u1_x1 * basis["u1x1"])
+            + np.sum(u1_x2 * basis["u1x2"])
+            + np.sum(u2_value * basis["u2"])
+            + np.sum(u2_x1 * basis["u2x1"])
+            + np.sum(u2_x2 * basis["u2x2"])
+        )
 
     def field_gradient(
         self,

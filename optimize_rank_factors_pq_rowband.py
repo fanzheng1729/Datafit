@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Compare vanilla and row-band-scaled optimizer steps from a saved state.
+"""Run row-band-scaled optimizer steps from a saved state.
 
 This experiment starts from an existing optimizer state and runs one of:
 
 * ``vanilla``: the full negative analytic gradient, as in the plain optimizer.
-* ``raw_pq``: only the raw negative gradient on u1/u2 P/Q blocks.
-* ``rowband_pq``: only u1/u2 P/Q blocks, with each coordinate row band scaled
+* ``raw_pq``: legacy raw negative gradient on u1/u2 P/Q blocks.
+* ``rowband_pq``: legacy u1/u2 P/Q blocks, with each coordinate row band scaled
   by the largest accepted unit step measured by
   ``diagnose_pq_support_step_scaling.py``.
 * ``rowband_all``: every optimized variable, using row bands for P/Q blocks and
-  one measured block scale for non-spatial ``s``, ``cl``, and ``cw`` variables.
+  one measured block scale for non-spatial ``s``, ``cl``, ``cw``, and ``rat``
+  variables.
 
 The objective itself is unchanged.  Every trial point is retracted/refit before
 evaluation, exactly like the existing monitored optimizer.
@@ -27,7 +28,7 @@ from local_deps import add_local_deps
 add_local_deps(__file__)
 
 import numpy as np
-from optimize_rank_factors import (
+from rank_optimizer_helpers import (
     GAUGE_TOLERANCE,
     INITIAL_STEP_SCALE,
     MIN_OBJECTIVE_DECREASE,
@@ -54,14 +55,13 @@ from rank_optimization_model import (
 )
 
 
-DEFAULT_STATE = Path("compare_curl_trust_rank_optimization_state.npz")
+DEFAULT_STATE = Path("from_begin_initial_state.npz")
 DEFAULT_ROWBAND_DIAGNOSTIC = Path("all_variable_rowband_step_scaling_diagnostic_results.json")
-DEFAULT_OUTPUT_PREFIX = "pq_rowband_rank_optimization"
+DEFAULT_OUTPUT_PREFIX = "rowband_all_rank_optimization"
 DEFAULT_CONSTRAINT_WEIGHT = 0.007
 
-# The pushed row-band result used only the velocity P/Q coefficient blocks.
-# ``rowband_all`` below can instead read target_blocks from a diagnostic JSON
-# generated with ``diagnose_pq_support_step_scaling.py --target-scope all``.
+# The legacy row-band P/Q mode uses only velocity P/Q coefficient blocks.
+# ``rowband_all`` reads target_blocks from an all-variable diagnostic JSON.
 PQ_TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
 
 # Optional extra shrink factors are useful for exploratory runs from difficult
@@ -118,7 +118,7 @@ def target_blocks_from_diagnostic(pq_diagnostic: dict[str, Any]) -> tuple[str, .
     """Read target blocks from a diagnostic JSON.
 
     For ``rowband_pq`` the target list is hard-coded for backward
-    compatibility with the pushed P/Q result.  For ``rowband_all`` the
+    compatibility with the legacy P/Q result. For ``rowband_all`` the
     diagnostic is authoritative because it records exactly which P/Q/s/scalar
     groups were probed and should therefore be moved.
     """
@@ -126,7 +126,10 @@ def target_blocks_from_diagnostic(pq_diagnostic: dict[str, Any]) -> tuple[str, .
     target_blocks = pq_diagnostic.get("target_blocks")
     if not target_blocks:
         raise ValueError("row-band diagnostic does not contain target_blocks")
-    return tuple(str(block) for block in target_blocks)
+    blocks = [str(block) for block in target_blocks]
+    if "rat" not in blocks:
+        blocks.append("rat")
+    return tuple(blocks)
 
 
 def selected_raw_direction(
@@ -214,6 +217,17 @@ def rowband_direction(
             block_direction = np.zeros_like(block_gradient)
         else:
             block_direction = 0.0
+        if block not in pq_diagnostic["block_results"]:
+            if isinstance(block_gradient, np.ndarray):
+                raise KeyError(f"row-band diagnostic does not contain block {block}")
+            safe_step = fallback_scalar_safe_step(pq_diagnostic)
+            direction[block] = apply_safe_step_to_group(
+                block_direction,
+                block_gradient,
+                None,
+                safe_step,
+            )
+            continue
         for group in pq_diagnostic["block_results"][block]["groups"]:
             safe_step = group["trial_summary"]["largest_accepted_step"]
             if safe_step is None:
@@ -234,6 +248,21 @@ def rowband_direction(
             )
         direction[block] = block_direction
     return direction
+
+
+def fallback_scalar_safe_step(pq_diagnostic: dict[str, Any]) -> float:
+    """Use the safest measured scalar-rate step for newly added scalars."""
+
+    steps: list[float] = []
+    for block in ("cl", "cw"):
+        block_result = pq_diagnostic.get("block_results", {}).get(block)
+        if not block_result:
+            continue
+        for group in block_result["groups"]:
+            safe_step = group["trial_summary"]["largest_accepted_step"]
+            if safe_step is not None and safe_step > 0.0:
+                steps.append(float(safe_step))
+    return min(steps) if steps else 1.0e-7
 
 
 def raw_direction_for_mode(
@@ -553,7 +582,7 @@ def run_optimizer(
         raise ValueError("step_sweep_start_multiplier must be positive and finite")
 
     model = RankOptimizationModel(DATA_PATH, constraint_weight=constraint_weight)
-    variables = load_state(state_path)
+    variables = model.complete_variables(load_state(state_path))
     # Only row-band mode needs the diagnostic, but accepting an optional path
     # keeps the JSON output comparable across modes.
     pq_diagnostic = None

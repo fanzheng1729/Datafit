@@ -56,9 +56,9 @@ u1_x2 - u2_x1 = omega
   rank-factor optimizer. It uses the same optimized variables, analytic
   gradient, fixed-gauge projection, line search, and retraction/refit structure
   as the Python optimizer.
-- `optimize_rank_factors_pq_rowband.m`: MATLAB wrapper for the pushed
-  all-variable row-band optimizer setup. It reuses `optimize_rank_factors.m`
-  and defaults to the recorded `constraintWeight = 0.007`, 30-step run with a
+- `optimize_rank_factors_pq_rowband.m`: MATLAB wrapper for the current
+  rat-enabled all-variable row-band optimizer setup. It reuses
+  `optimize_rank_factors.m` and defaults to `constraintWeight = 0.007` with a
   neighbor scheduled step sweep.
 - `runfit.py`: Python equivalent of the MATLAB fit/check path. See
   `README_PYTHON.md` for MAT-file loading and implementation details.
@@ -129,7 +129,7 @@ with, the Python optimizer.
 
 ### MATLAB Row-Band Optimizer
 
-The pushed row-band setup has a MATLAB wrapper:
+The current row-band setup has a MATLAB wrapper:
 
 ```powershell
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband();"
@@ -151,9 +151,9 @@ the adjacent larger/smaller multipliers on the ladder, and keeps walking only
 if the best accepted candidate is at the edge of the local bracket. On
 intervening iterations it uses the last accepted multiplier directly. If that
 single trusted step fails, `RecoveryStepSweep = true` falls back to one full
-bracket sweep for that iteration. The wrapper reads the converted MATLAB
-starting state `compare_curl_trust_rank_optimization_state.mat` and the
-diagnostic `all_variable_rowband_step_scaling_diagnostic_results.json`.
+bracket sweep for that iteration. The wrapper starts from the canonical
+`data.mat` fit and reads the rat-enabled all-variable diagnostic
+`all_variable_rowband_step_scaling_diagnostic_results.json`.
 
 To restore the old full-sweep behavior, set `StepSweepMode` to `"full"` and
 `StepSweepPeriod` to `1`:
@@ -172,10 +172,10 @@ matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_ro
 `UseParallel` defaults to `false`. On the current 7-candidate line search,
 serial evaluation was slightly faster than a warmed 4-worker process pool, so
 parallel mode is mainly an optional experiment for heavier candidate workloads.
-The neighbor scheduled-sweep policy is the recommended serial path: in a
-30-step probe it used 50 candidate evaluations instead of 90 for scheduled full
-sweeps or 210 for full sweeps every iteration, accepted all 30 steps, and
-reached the same `J = 0.4762753188` as the scheduled-full run.
+The neighbor scheduled-sweep policy is the recommended serial path. With the
+updated weight-`0.007` diagnostic, the matching Python saved-state check
+reduced `J` from `1.0070000000` to `0.1807256857` before the next line-search
+bracket stopped.
 
 For long MATLAB runs, enable periodic checkpointing:
 
@@ -260,81 +260,30 @@ the final fitted grid.
 
 ## Optimization Code
 
-The optimization-related Python code is now split by role:
+The current Python optimization side is kept as a compact mirror/check stack
+for the rat-enabled all-variable row-band path:
 
-- `rank_optimization_model.py` is the shared explicit-`S` rank-factor model. It
-  owns the variables `P,Q,s,c_l,c_omega`, objective evaluation, analytic
-  gradients, fixed-gauge tangent projection, and retraction/refit hook.
-- `gradient_check_rank.py` checks those shared analytic gradients against
-  finite differences, including the explicit singular-amplitude variables `s`.
-- `rank_factor_tools.py` contains the reusable rank-chart mechanics:
-  `L diag(s) M.T` synthesis, weighted QR/SVD retraction, and B-spline refit.
-- `check_retraction_refit.py` verifies that retraction/refit preserves all four
-  fitted cores under the current discrete grid/SVD norm.
-- `optimize_rank_factors.py` is the current explicit-`S` optimizer probe. It
-  iterates analytic gradient steps, projects them onto the fixed-gauge tangent
-  space, performs a line search, retracts/refits candidates, and saves
-  `rank_optimization_results.json` plus `rank_optimization_state.npz` if a step
-  is accepted.
-- `optimize_rank_factors_lbfgs.py` is the projected/retracted L-BFGS experiment
-  using the mild block preconditioner as its initial inverse metric.
-- `optimize_rank_factors_continuation.py` runs staged constraint-weight
-  continuation on top of the L-BFGS optimizer and carries each saved stage state
-  into the next stage.
-- `optimize_rank_factors_curl_trust.py` is the current same-formulation
-  recommendation. It keeps the projected/retracted L-BFGS model but damps the
-  curl-hot velocity block before line search, addressing the localized
-  step-size bottleneck without changing the equations.
-- `optimize_rank_factors_damped_curl_loss.py` is a vanilla-gradient diagnostic
-  that multiplies the curl-equation loss by
-  `(1 + x1^2 + x2^2)^(-p)` to test whether far-field curl weighting causes the
-  huge gradient.
-- `optimize_rank_factors_damped_curl_output.py` is the analogous diagnostic
-  with the damping wired into the curl residual output before the loss sees it.
-- `optimize_profile.py` is the older low-dimensional correction-basis pilot. It
-  remains useful for comparison, but it is not the full rank-factor optimizer.
+- `rank_optimization_model.py` owns the explicit `P,Q,s,c_l,c_omega,rat`
+  variables, objective evaluation, analytic gradients, fixed-gauge tangent
+  projection, and retraction/refit hook.
+- `rank_optimizer_helpers.py` contains the shared line-search, history, and
+  NPZ persistence helpers used by Python optimizer entry points.
+- `optimize_rank_factors_pq_rowband.py` runs the saved-state row-band optimizer.
+  Its defaults are `rowband_all`, constraint weight `0.007`,
+  `from_begin_initial_state.npz`, and
+  `all_variable_rowband_step_scaling_diagnostic_results.json`.
+- `diagnose_pq_support_step_scaling.py` regenerates row-band safe-step
+  diagnostics. Its default target scope is now `all`, including `rat`.
+- `gradient_check_rank.py`, `check_retraction_refit.py`, and
+  `test_gradient_direction_signs.py` are retained as sanity checks for the
+  shared model and chart mechanics.
+- `rank_factor_tools.py`, `runfit.py`, and `local_deps.py` provide the reusable
+  rank-chart, MATLAB-data, and local-dependency support.
 
-All standalone Python entry points prepend a compatible `.python_deps` folder
-before importing NumPy/SciPy when one exists. This keeps the optimizer and
-diagnostics on the same linear-algebra stack while avoiding incompatible binary
-wheels from another Python version.
+The older vanilla-gradient, L-BFGS, curl-trust, damped-curl, P/Q-only result,
+and profile-pilot Python files have been removed from the active workspace.
 
-The best saved Python optimizer state is now the curl-aware same-start L-BFGS
-run in `compare_curl_trust_rank_optimization_state.npz`. It starts from
-`extend10_continuation_w10_rank_optimization_stage01_w10_state.npz`, the staged
-continuation run `1 -> 3 -> 10` followed by ten 25-step extensions at
-constraint weight `10`, and then takes 25 additional accepted weight-10 steps.
-It reduces the objective from `10.900680211033425` to `10.898737138237642`,
-with curl RMS `7.589398181576124e-06` and max gauge error about `8.44e-15`.
-The fair same-start plain L-BFGS comparison is
-`compare_extend10_plain_lbfgs_rank_optimization_state.npz`, which ends at
-`10.899956069050866`; the curl-aware objective drop is about `2.68x` larger.
-The comparison summary is
-`compare_rank_optimization_curl_trust_vs_plain_extend10_summary.json`.
-
-The committed optimizer recommendation is the row-band P/Q direction with the
-low constraint weight `3e-4`.  Starting from
-`compare_curl_trust_rank_optimization_state.npz`, the recorded 30-step run
-reduces the weighted objective from `1.000296931941260` to
-`1.000227625747525` while keeping all four unweighted components
-nonincreasing.
-
-The damped-curl-loss diagnostic confirms the localization picture but is not
-the main recommendation: among powers `1/32, 1/16, 1/8, 1/4`, `p=1/16` gave
-the best 20-step vanilla result, reducing the original undamped objective to
-`10.95392361796` versus vanilla's `10.95438481804`. Stronger damping mostly
-removed the far-field curl equation from the loss. The summary is
-`compare_rank_optimization_damped_curl_loss_summary.json`.
-
-When the damping is wired into the curl residual output instead, the best
-20-step tested value was much weaker, `p=1/256`: it reduced the damped-output
-objective by `0.419335%` from start, only slightly above vanilla's `0.414683%`.
-Testing stronger output damping (`p=1/4, 1/2, 1`) made this worse: the
-damped-output objective reductions were only `0.001180%`, `0.000363%`, and
-`0.006243%`, respectively.
-The summary is `compare_rank_optimization_damped_curl_output_summary.json`.
-
-### Run the Rank-Factor Optimizer
+### Run the Python Row-Band Check
 
 From PowerShell outside Codex:
 
@@ -342,35 +291,15 @@ From PowerShell outside Codex:
 cd C:\Users\Fan\Documents\Datafit
 $cp = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
 python -m pip install --target ".python_deps\$cp" -r requirements.txt
-python optimize_rank_factors.py --max-iterations 50
-```
-
-Use `-n` as a short form:
-
-```powershell
-python optimize_rank_factors.py -n 50
+python optimize_rank_factors_pq_rowband.py
 ```
 
 By default, the optimizer writes:
 
 ```text
-rank_optimization_results.json
-rank_optimization_history.csv
-rank_optimization_state.npz
-```
-
-For a test run that does not overwrite the main optimizer artifacts, choose a
-different output prefix:
-
-```powershell
-python optimize_rank_factors.py --max-iterations 2 --output-prefix smoke_rank_optimization
-```
-
-The optimizer prints one brief progress line after each accepted step, for
-example:
-
-```text
-iter 01/50: J=1.096590437052e+01 dJ=-3.410e-02 step=3.000e-16 |g_T|=4.298e+14 curl=7.641e-06 gauge=0.000e+00
+rowband_all_rank_optimization_results.json
+rowband_all_rank_optimization_history.csv
+rowband_all_rank_optimization_state.npz
 ```
 
 ## Verified Outputs

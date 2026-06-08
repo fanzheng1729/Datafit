@@ -178,7 +178,7 @@ def main() -> int:
     model = RankOptimizationModel(DATA_PATH)
     starts = [("baseline", copy_variables(model.variables))]
     if STATE_NPZ.exists():
-        starts.append(("saved_final_state", load_state(STATE_NPZ)))
+        starts.append(("saved_final_state", model.complete_variables(load_state(STATE_NPZ))))
 
     results = {
         "description": "Constrained/retracted test of projected +gradient versus -gradient directions.",

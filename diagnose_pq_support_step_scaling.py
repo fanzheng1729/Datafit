@@ -9,9 +9,10 @@ power law
 
     safe_step ~= C * (1 + axis_coordinate^2)^alpha
 
-for each spatial P/Q block.  With ``--target-scope all`` it also probes the
-non-spatial ``s``, ``cl``, and ``cw`` variables as single blocks so an optimizer
-can move every variable while still using measured safe scales.
+for each spatial P/Q block.  With the default ``--target-scope all`` it also
+probes the non-spatial ``s``, ``cl``, ``cw``, and ``rat`` variables as single
+blocks so an optimizer can move every variable while still using measured safe
+scales.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ add_local_deps(__file__)
 
 import numpy as np
 
-from optimize_rank_factors import (
+from rank_optimizer_helpers import (
     GAUGE_TOLERANCE,
     MIN_OBJECTIVE_DECREASE,
     candidate_summary_with_evaluation,
@@ -45,8 +46,8 @@ from rank_optimization_model import (
 )
 
 
-DEFAULT_STATE = Path("compare_curl_trust_rank_optimization_state.npz")
-DEFAULT_OUTPUT = Path("pq_support_step_scaling_diagnostic_results.json")
+DEFAULT_STATE = Path("from_begin_initial_state.npz")
+DEFAULT_OUTPUT = Path("all_variable_rowband_step_scaling_diagnostic_results.json")
 DEFAULT_STEPS = [
     1.0e-5,
     3.0e-6,
@@ -109,7 +110,7 @@ def zero_like_variables(variables: VariableDict) -> VariableDict:
 
 
 def load_state(path: Path) -> VariableDict:
-    """Load an optimizer NPZ state saved by ``optimize_rank_factors.save_state``.
+    """Load an optimizer NPZ state saved by ``rank_optimizer_helpers.save_state``.
 
     The repository keeps the useful starting state in LFS.  Reimplementing this
     small loader here keeps the diagnostic self-contained rather than depending
@@ -210,15 +211,15 @@ def all_target_blocks(model: RankOptimizationModel) -> tuple[str, ...]:
     blocks: list[str] = []
     for core in model.cores:
         blocks.extend([core.p_key, core.q_key, core.s_key])
-    blocks.extend(["cl", "cw"])
+    blocks.extend(["cl", "cw", "rat"])
     return tuple(blocks)
 
 
 def target_blocks_for_scope(model: RankOptimizationModel, scope: str) -> tuple[str, ...]:
     """Resolve a user-facing target scope into concrete variable blocks.
 
-    ``pq`` preserves the pushed experiment's velocity-only scope.  ``all`` is
-    the broader experiment requested later, and is the diagnostic consumed by
+    ``pq`` preserves the legacy velocity-only scope. ``all`` is the current
+    rat-enabled scope, and is the diagnostic consumed by
     ``optimize_rank_factors_pq_rowband.py --mode rowband_all``.
     """
 
@@ -637,8 +638,8 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--target-scope",
         choices=("pq", "all"),
-        default="pq",
-        help="pq probes the pushed velocity P/Q blocks; all probes every optimizer variable",
+        default="all",
+        help="all probes every optimizer variable; pq keeps the old velocity P/Q-only diagnostic",
     )
     return parser.parse_args()
 
@@ -646,7 +647,7 @@ def parse_args() -> Namespace:
 def main() -> None:
     args = parse_args()
     model = RankOptimizationModel(DATA_PATH, constraint_weight=args.constraint_weight)
-    variables = load_state(args.state)
+    variables = model.complete_variables(load_state(args.state))
     evaluation = model.evaluate(variables)
     gradient = model.analytic_gradient(variables, evaluation=evaluation)
     base_objective = model.objective_from_residuals(evaluation.residuals)

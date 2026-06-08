@@ -66,7 +66,7 @@ def coordinate_checks(
             )
         )
 
-    for key in ["cl", "cw"]:
+    for key in ["cl", "cw", "rat"]:
         checks.append(
             best_coordinate_difference(
                 model,
