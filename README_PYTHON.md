@@ -31,7 +31,8 @@ row-band experiment:
   retraction/refit, and variables `P,Q,s,c_l,c_omega,rat`.
 - `rank_optimizer_helpers.py`: shared candidate evaluation, line-search,
   history, and state persistence helpers.
-- `optimize_rank_factors_pq_rowband.py`: saved-state row-band optimizer.
+- `optimize_rank_factors_pq_rowband.py`: saved-state row-band optimizer with
+  preconditioned fixed-gauge projection in `rowband_all`.
 - `diagnose_pq_support_step_scaling.py`: all-variable row-band safe-step
   diagnostic generator.
 - `gradient_check_rank.py`, `check_retraction_refit.py`, and

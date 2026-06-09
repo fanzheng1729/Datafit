@@ -130,79 +130,70 @@ def selected_raw_direction(
     return direction
 
 
-def apply_safe_step_to_group(
-    block_direction: np.ndarray | float,
+def set_group_scale(
+    block_scale: np.ndarray | float,
     block_gradient: np.ndarray | float,
     rows: range | None,
     safe_step: float,
 ) -> np.ndarray | float:
-    """Scale one block group to its measured safe step.
+    """Store ``safe_step / ||gradient group||`` for one block group.
 
     P/Q groups pass a row range, singular-value vectors pass all rows, and
-    scalar rates pass ``rows=None``.  The returned chunk always keeps the raw
-    negative-gradient direction and replaces only the chunk norm.
+    scalar rates pass ``rows=None``. The resulting scale is the diagonal
+    row-band metric used for both the raw direction and gauge projection.
     """
 
     if isinstance(block_gradient, np.ndarray):
-        assert isinstance(block_direction, np.ndarray)
+        assert isinstance(block_scale, np.ndarray)
         if rows is None:
-            # A non-spatial array block such as ``omega_s`` is probed as a
-            # single vector, so the whole array gets one measured scale.
             chunk = block_gradient
             norm = float(np.linalg.norm(chunk))
             if norm > 0.0:
-                block_direction[...] = -chunk * (safe_step / norm)
+                block_scale[...] = safe_step / norm
         elif block_gradient.ndim == 1:
             row_list = list(rows)
             chunk = block_gradient[row_list]
             norm = float(np.linalg.norm(chunk))
             if norm > 0.0:
-                block_direction[row_list] = -chunk * (safe_step / norm)
+                block_scale[row_list] = safe_step / norm
         else:
             row_list = list(rows)
             chunk = block_gradient[row_list, :]
             norm = float(np.linalg.norm(chunk))
             if norm > 0.0:
-                block_direction[row_list, :] = -chunk * (safe_step / norm)
-        return block_direction
+                block_scale[row_list, :] = safe_step / norm
+        return block_scale
 
     gradient_value = float(block_gradient)
     norm = abs(gradient_value)
     if norm > 0.0:
-        # Scalars have no row structure.  Their "unit direction" is simply the
-        # sign of the negative gradient, scaled by the measured safe step.
-        return -gradient_value * (safe_step / norm)
-    return block_direction
+        return safe_step / norm
+    return block_scale
 
 
-def rowband_direction(
+def rowband_preconditioner(
     variables: VariableDict,
     gradient: VariableDict,
     rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
 ) -> VariableDict:
-    """Build the measured row-band-scaled descent direction.
+    """Build the measured positive row-band metric.
 
     The diagnostic JSON stores the largest accepted unit-norm step found for
-    each P/Q coordinate row band and for each non-spatial block.  This function
-    preserves the local raw descent direction but replaces each group's raw
-    magnitude with the measured safe step.
+    each P/Q coordinate row band and for each non-spatial block. This function
+    stores the corresponding diagonal preconditioner scale for each group.
     """
 
-    direction = zero_like_variables(variables)
+    preconditioner = zero_like_variables(variables)
     for block in target_blocks:
         block_gradient = gradient[block]
-        block_direction: np.ndarray | float
-        if isinstance(block_gradient, np.ndarray):
-            block_direction = np.zeros_like(block_gradient)
-        else:
-            block_direction = 0.0
+        block_scale = preconditioner[block]
         if block not in rowband_diagnostic["block_results"]:
             if isinstance(block_gradient, np.ndarray):
                 raise KeyError(f"row-band diagnostic does not contain block {block}")
             safe_step = fallback_scalar_safe_step(rowband_diagnostic)
-            direction[block] = apply_safe_step_to_group(
-                block_direction,
+            preconditioner[block] = set_group_scale(
+                block_scale,
                 block_gradient,
                 None,
                 safe_step,
@@ -217,16 +208,36 @@ def rowband_direction(
                 if isinstance(block_gradient, np.ndarray)
                 else None
             )
-            # This is the core preconditioner: preserve the local descent
-            # direction but replace its raw magnitude with the safe
-            # row-band/block step measured by the diagnostic.
-            block_direction = apply_safe_step_to_group(
-                block_direction,
+            block_scale = set_group_scale(
+                block_scale,
                 block_gradient,
                 rows,
                 float(safe_step),
             )
-        direction[block] = block_direction
+        preconditioner[block] = block_scale
+    return preconditioner
+
+
+def apply_rowband_preconditioner(values: VariableDict, preconditioner: VariableDict) -> VariableDict:
+    """Apply a variable-shaped diagonal row-band metric."""
+
+    out = zero_like_variables(values)
+    for key, value in values.items():
+        scale = preconditioner[key]
+        if isinstance(value, np.ndarray):
+            assert isinstance(scale, np.ndarray)
+            out[key] = scale * value
+        else:
+            out[key] = float(scale) * float(value)
+    return out
+
+
+def rowband_direction(gradient: VariableDict, preconditioner: VariableDict) -> VariableDict:
+    """Return the row-band preconditioned negative gradient."""
+
+    direction = apply_rowband_preconditioner(gradient, preconditioner)
+    for key, value in direction.items():
+        direction[key] = -value if isinstance(value, np.ndarray) else -float(value)
     return direction
 
 
@@ -250,25 +261,95 @@ def raw_direction_for_mode(
     variables: VariableDict,
     gradient: VariableDict,
     rowband_diagnostic: dict[str, Any] | None,
-) -> VariableDict:
+) -> tuple[VariableDict, VariableDict | None]:
     """Select the raw direction family requested by ``--mode``."""
 
     if mode == "vanilla":
-        return negative_gradient(gradient)
+        return negative_gradient(gradient), None
     if mode == "raw_all":
         if rowband_diagnostic is None:
             raise ValueError("raw_all mode requires a diagnostic JSON with target_blocks")
-        return selected_raw_direction(variables, gradient, target_blocks_from_diagnostic(rowband_diagnostic))
+        return selected_raw_direction(variables, gradient, target_blocks_from_diagnostic(rowband_diagnostic)), None
     if mode == "rowband_all":
         if rowband_diagnostic is None:
             raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
-        return rowband_direction(
+        preconditioner = rowband_preconditioner(
             variables,
             gradient,
             rowband_diagnostic,
             target_blocks_from_diagnostic(rowband_diagnostic),
         )
+        return rowband_direction(gradient, preconditioner), preconditioner
     raise ValueError(f"unknown mode: {mode}")
+
+
+def projected_tangent_direction_for_mode(
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    raw_direction: VariableDict,
+    preconditioner: VariableDict | None,
+) -> VariableDict:
+    """Project the direction into the fixed-gauge tangent space."""
+
+    if preconditioner is None:
+        return model.projected_tangent_direction(variables, raw_direction)
+    return preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner)
+
+
+def preconditioned_projected_tangent_direction(
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    preconditioner: VariableDict,
+) -> VariableDict:
+    """Build ``d = -B(g + A lambda)`` with ``A.T d = 0``.
+
+    ``B`` is the positive row-band metric from the diagnostic. Using it for
+    both the gradient and gauge correction preserves the descent guarantee of
+    the preconditioned direction after gauge projection.
+    """
+
+    gauges = model.gauge_gradients(variables)
+    names = ["omega_x1_00", "theta_x1x1_00"]
+    preconditioned_gradient = apply_rowband_preconditioner(gradient, preconditioner)
+    projected: VariableDict = {
+        key: -value if isinstance(value, np.ndarray) else -float(value)
+        for key, value in preconditioned_gradient.items()
+    }
+    preconditioned_gauges = {
+        name: apply_rowband_preconditioner(gauges[name], preconditioner)
+        for name in names
+    }
+    gram = np.array(
+        [
+            [variable_dot(gauges[left], preconditioned_gauges[right]) for right in names]
+            for left in names
+        ],
+        dtype=float,
+    )
+    rhs = np.array([variable_dot(gauges[name], projected) for name in names], dtype=float)
+    if np.linalg.cond(gram) > 1.0e14:
+        correction = np.linalg.pinv(gram) @ rhs
+    else:
+        correction = np.linalg.solve(gram, rhs)
+
+    for coefficient, name in zip(correction, names):
+        gauge_step = preconditioned_gauges[name]
+        for key, value in projected.items():
+            step_value = gauge_step[key]
+            if isinstance(value, np.ndarray):
+                assert isinstance(step_value, np.ndarray)
+                value -= coefficient * step_value
+            else:
+                projected[key] = float(value) - float(coefficient) * float(step_value)
+    return projected
+
+
+def gauge_projection_name(preconditioner: VariableDict | None) -> str:
+    """Return the projection label for result JSON."""
+
+    return "preconditioned" if preconditioner is not None else "euclidean"
 
 
 def effective_step_multipliers() -> list[float]:
@@ -562,17 +643,25 @@ def run_optimizer(
     history: list[dict[str, float | int | str]] = []
     candidate_history: list[dict[str, Any]] = []
     stop_reason = "reached maximum iterations"
+    last_projection = "euclidean"
     paths = output_paths(output_prefix)
 
     for iteration in range(1, max_iterations + 1):
         base_objective = model.objective_from_residuals(current_evaluation.residuals)
         base_components = objective_components(model, current_evaluation.residuals)
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
-        raw_direction = raw_direction_for_mode(mode, variables, gradient, rowband_diagnostic)
-        tangent_direction = model.projected_tangent_direction(variables, raw_direction)
+        raw_direction, preconditioner = raw_direction_for_mode(mode, variables, gradient, rowband_diagnostic)
+        tangent_direction = projected_tangent_direction_for_mode(
+            model,
+            variables,
+            gradient,
+            raw_direction,
+            preconditioner,
+        )
         direction, direction_norm_before_normalization = normalize_direction(tangent_direction)
         gradient_norm = variable_norm(gradient)
         directional_derivative = variable_dot(gradient, direction)
+        last_projection = gauge_projection_name(preconditioner)
         if (
             direction_norm_before_normalization == 0.0
             or not np.isfinite(directional_derivative)
@@ -724,6 +813,7 @@ def run_optimizer(
         "gauge_targets": model.gauge_targets,
         "gauge_errors_before": initial_gauge_errors,
         "gauge_errors_after": final_gauge_errors,
+        "gauge_projection": last_projection,
         "initial_step_scale": initial_step_scale,
         "line_search_step_multipliers": effective_step_multipliers(),
         "step_sweep_initial_iterations": step_sweep_initial_iterations,

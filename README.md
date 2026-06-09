@@ -250,7 +250,9 @@ for the rat-enabled all-variable row-band path:
 - `optimize_rank_factors_pq_rowband.py` runs the saved-state row-band optimizer.
   Its defaults are `rowband_all`, constraint weight `0.007`,
   `from_begin_initial_state.npz`, and
-  `all_variable_rowband_step_scaling_diagnostic_results.json`.
+  `all_variable_rowband_step_scaling_diagnostic_results.json`. In
+  `rowband_all`, it uses the same measured row-band metric for the descent
+  direction and fixed-gauge projection.
 - `diagnose_pq_support_step_scaling.py` regenerates the all-variable row-band
   safe-step diagnostic, including `rat`.
 - `gradient_check_rank.py`, `check_retraction_refit.py`, and
