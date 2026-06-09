@@ -34,6 +34,7 @@ if strlength(opts.statePath) > 0
 else
     variables = copy_variables(model.variables);
 end
+initial_variables = copy_variables(variables);
 rowband_diagnostic = read_rowband_diagnostic(opts.rowbandDiagnostic, opts.mode);
 target_blocks = target_blocks_for_mode(opts.mode, rowband_diagnostic);
 if mode_needs_diagnostic(opts.mode)
@@ -53,6 +54,9 @@ last_step_multiplier = opts.initialStepMultiplier;
 history = struct([]);
 candidate_history = struct([]);
 stop_reason = "reached maximum iterations";
+last_gradient_norm = NaN;
+last_projected_gradient_norm = NaN;
+last_directional_derivative = NaN;
 paths = output_paths(opts.outputPrefix);
 if opts.checkpointPeriod > 0
     fprintf("  checkpoint state:         %s\n", paths.checkpointState);
@@ -62,15 +66,20 @@ for iteration = 1:opts.maxIterations
     base_objective = objective_from_residuals(model, current_evaluation.residuals);
     base_components = objective_components(model, current_evaluation.residuals);
     gradient = analytic_gradient(model, variables, current_evaluation);
-    raw_direction = raw_direction_for_mode(opts.mode, variables, gradient, rowband_diagnostic, target_blocks, model);
+    [raw_direction, preconditioner] = raw_direction_for_mode( ...
+        opts.mode, variables, gradient, rowband_diagnostic, target_blocks, model);
 
     % Project the raw negative gradient into the tangent space of the origin
     % gauges before trying any step. This keeps c_l and c_omega tied to the
     % normalization conditions used by the dynamic-rescaling equations.
-    tangent_direction = projected_tangent_direction(model, variables, raw_direction);
+    tangent_direction = projected_tangent_direction( ...
+        model, variables, gradient, raw_direction, preconditioner);
     [direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
     gradient_norm = variable_norm(gradient, model.variableKeys);
     directional_derivative = variable_dot(gradient, direction, model.variableKeys);
+    last_gradient_norm = gradient_norm;
+    last_projected_gradient_norm = projected_gradient_norm;
+    last_directional_derivative = directional_derivative;
 
     if ~isfinite(directional_derivative) || directional_derivative >= 0
         stop_reason = "projected direction was not a descent direction";
@@ -78,7 +87,7 @@ for iteration = 1:opts.maxIterations
     end
 
     search_step_scale = step_scale;
-    if is_rowband_mode(opts.mode) && opts.rowbandUseNaturalStep
+    if is_rowband_mode(opts.mode)
         % Row-band directions already carry the measured safe group magnitudes.
         % The line search therefore starts from that natural norm, as in the
         % pushed Python comparison, instead of the tiny vanilla gradient scale.
@@ -128,7 +137,7 @@ for iteration = 1:opts.maxIterations
         iteration, best.objective, best.objective_change, best.step, ...
         gradient_norm, projected_gradient_norm, directional_derivative, ...
         gauge_errors, residuals, opts.mode, search_step_scale, components, ...
-        best.step_search_mode, best.step_multiplier, iteration_trial_count);
+        best.step_search_mode, best.step_multiplier, iteration_trial_count, variables);
     history = append_struct(history, row);
 
     fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e mult=%.3g search=%s trials=%d |d_raw|=%.3e div_loss=%.3e curl_loss=%.3e gauge=%.3e\n", ...
@@ -180,13 +189,17 @@ output.objective_change = final_objective - initial_objective;
 output.relative_objective_change = (final_objective - initial_objective) / initial_objective;
 output.objective_components_before = initial_components;
 output.objective_components_after = final_components;
+output.scalars_before = scalar_summary(initial_variables);
+output.scalars_after = scalar_summary(variables);
 output.initial_residual_rms = initial_residuals;
 output.final_residual_rms = final_residuals;
 output.gauge_targets = model.gaugeTargets;
 output.gauge_errors_before = initial_gauge_errors;
 output.gauge_errors_after = final_gauge_errors;
-output.rowband_use_natural_step = opts.rowbandUseNaturalStep;
-output.include_extra_shrinks = opts.includeExtraShrinks;
+output.gauge_projection = gauge_projection_for_mode(opts.mode);
+output.last_gradient_norm = last_gradient_norm;
+output.last_projected_gradient_norm = last_projected_gradient_norm;
+output.last_directional_derivative = last_directional_derivative;
 output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
@@ -240,9 +253,6 @@ opts.minObjectiveDecrease = 1.0e-10;
 opts.gaugeTolerance = 1.0e-8;
 opts.initialStepScale = 3.0e-16;
 opts.stepMultipliers = [10.0, 3.0, 1.0, 0.3, 0.1, 0.03, 0.01];
-opts.extraShrinks = [0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001];
-opts.includeExtraShrinks = false;
-opts.rowbandUseNaturalStep = true;
 opts.useParallel = false;
 opts.stepSweepInitialIterations = 0;
 opts.stepSweepPeriod = 1;
@@ -285,14 +295,6 @@ for k = 1:2:numel(varargin)
             opts.initialStepScale = value;
         case "stepmultipliers"
             opts.stepMultipliers = value;
-        case "includeextrashrinks"
-            opts.includeExtraShrinks = logical_option(value);
-        case "noextrashrinks"
-            opts.includeExtraShrinks = ~logical_option(value);
-        case "fixedrowbandstepscale"
-            opts.rowbandUseNaturalStep = ~logical_option(value);
-        case "rowbandusenaturalstep"
-            opts.rowbandUseNaturalStep = logical_option(value);
         case "useparallel"
             opts.useParallel = logical_option(value);
         case {"stepsweepinitialiterations", "initialstepsweeps", "stepsweepwarmup"}
@@ -374,13 +376,9 @@ end
 end
 
 function multipliers = effective_step_multipliers(opts)
-% The pushed row-band result used the original seven-point bracket; the extra
-% shrink factors remain available for exploratory runs that need them.
+% The pushed row-band result uses the original seven-point bracket.
 
 multipliers = opts.stepMultipliers;
-if opts.includeExtraShrinks
-    multipliers = [multipliers, opts.extraShrinks];
-end
 end
 
 function steps = line_search_steps(stepScale, multipliers)
@@ -448,6 +446,16 @@ end
 
 function yes = is_rowband_mode(mode)
 yes = startsWith(string(mode), "rowband_");
+end
+
+function modeName = gauge_projection_for_mode(mode)
+% Row-band directions use the same measured metric for gauge projection.
+
+if is_rowband_mode(mode)
+    modeName = "preconditioned";
+else
+    modeName = "euclidean";
+end
 end
 
 function yes = mode_needs_diagnostic(mode)
@@ -546,17 +554,21 @@ for keyName = model.variableKeys
 end
 end
 
-function direction = raw_direction_for_mode(mode, variables, gradient, diagnostic, targetBlocks, model)
+function [direction, preconditioner] = raw_direction_for_mode(mode, variables, gradient, diagnostic, targetBlocks, model)
 % Select the descent direction family requested by Mode.
 
 mode = string(mode);
+preconditioner = [];
 switch mode
     case "vanilla"
         direction = scale_variables(gradient, -1.0, model.variableKeys);
     case {"raw_pq", "raw_all"}
         direction = selected_raw_direction(variables, gradient, targetBlocks, model.variableKeys);
     case {"rowband_pq", "rowband_all"}
-        direction = rowband_direction(variables, gradient, diagnostic, targetBlocks, model.variableKeys);
+        preconditioner = rowband_preconditioner(gradient, diagnostic, targetBlocks, model.variableKeys);
+        direction = scale_variables( ...
+            apply_rowband_preconditioner(gradient, preconditioner, model.variableKeys), ...
+            -1.0, model.variableKeys);
     otherwise
         error("Unknown optimizer mode: %s", mode);
 end
@@ -572,22 +584,21 @@ for blockName = targetBlocks
 end
 end
 
-function direction = rowband_direction(variables, gradient, diagnostic, targetBlocks, keys)
-% Measured row-band direction used by the pushed optimizer.
-%
-% Each group keeps the local negative-gradient direction but replaces that
-% group's norm by the largest accepted unit step measured in the diagnostic.
+function preconditioner = rowband_preconditioner(gradient, diagnostic, targetBlocks, keys)
+% Positive block/row scalings that define the measured row-band metric.
 
-direction = zero_like_variables(variables, keys);
+preconditioner = struct();
+for keyName = keys
+    key = char(keyName);
+    preconditioner.(key) = zeros(size(gradient.(key)));
+end
 for blockName = targetBlocks
     block = char(blockName);
     blockGradient = gradient.(block);
-    blockDirection = zeros(size(blockGradient));
     if ~isfield(diagnostic.block_results, block)
         if numel(blockGradient) == 1
             safeStep = fallback_scalar_safe_step(diagnostic);
-            blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, 1, safeStep);
-            direction.(block) = blockDirection;
+            preconditioner.(block) = set_group_scale(preconditioner.(block), blockGradient, 1, safeStep);
             continue
         end
         error("Row-band diagnostic does not contain block %s.", block);
@@ -600,9 +611,43 @@ for blockName = targetBlocks
             continue
         end
         rows = (double(group.row_min) + 1):(double(group.row_max) + 1);
-        blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, rows, safeStep);
+        preconditioner.(block) = set_group_scale(preconditioner.(block), blockGradient, rows, safeStep);
     end
-    direction.(block) = blockDirection;
+end
+end
+
+function blockScale = set_group_scale(blockScale, blockGradient, rows, safeStep)
+% Store safeStep / ||gradient group|| for one scalar, vector, or row band.
+
+if numel(blockGradient) == 1
+    normValue = abs(blockGradient);
+    if normValue > 0
+        blockScale = safeStep / normValue;
+    end
+elseif isvector(blockGradient)
+    rows = rows(rows >= 1 & rows <= numel(blockGradient));
+    chunk = blockGradient(rows);
+    normValue = norm(chunk(:));
+    if normValue > 0
+        blockScale(rows) = safeStep / normValue;
+    end
+else
+    rows = rows(rows >= 1 & rows <= size(blockGradient, 1));
+    chunk = blockGradient(rows, :);
+    normValue = norm(chunk(:));
+    if normValue > 0
+        blockScale(rows, :) = safeStep / normValue;
+    end
+end
+end
+
+function out = apply_rowband_preconditioner(variables, preconditioner, keys)
+% Apply the current row-band metric to any variable-shaped dictionary.
+
+out = zero_like_variables(variables, keys);
+for keyName = keys
+    key = char(keyName);
+    out.(key) = preconditioner.(key) .* variables.(key);
 end
 end
 
@@ -638,31 +683,6 @@ if isempty(safeStep)
     return
 end
 safeStep = double(safeStep);
-end
-
-function blockDirection = apply_safe_step_to_group(blockDirection, blockGradient, rows, safeStep)
-% Scale one row band, singular-value vector, or scalar rate to its safe step.
-
-if numel(blockGradient) == 1
-    normValue = abs(blockGradient);
-    if normValue > 0
-        blockDirection = -blockGradient * (safeStep / normValue);
-    end
-elseif isvector(blockGradient)
-    rows = rows(rows >= 1 & rows <= numel(blockGradient));
-    chunk = blockGradient(rows);
-    normValue = norm(chunk(:));
-    if normValue > 0
-        blockDirection(rows) = -chunk * (safeStep / normValue);
-    end
-else
-    rows = rows(rows >= 1 & rows <= size(blockGradient, 1));
-    chunk = blockGradient(rows, :);
-    normValue = norm(chunk(:));
-    if normValue > 0
-        blockDirection(rows, :) = -chunk * (safeStep / normValue);
-    end
-end
 end
 
 function model = build_model(constraintWeight)
@@ -1130,9 +1150,15 @@ out.(core.qKey) = scale * (core.y0(1, :)' * (factor * left_x1 .* s + factor_x1 *
 out.(core.sKey) = scale * (factor * left_x1 .* right + factor_x1 * left .* right)';
 end
 
-function projected = projected_tangent_direction(model, variables, raw_direction)
+function projected = projected_tangent_direction(model, variables, gradient, raw_direction, preconditioner)
 % Remove components of raw_direction that would change the origin gauges to
-% first order. The tiny 2x2 solve is the Gram projection in variable space.
+% first order. The preconditioned mode uses the same positive row-band metric
+% as the raw direction, preserving the first-order downhill guarantee.
+
+if ~isempty(preconditioner)
+    projected = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner);
+    return
+end
 
 gauges = gauge_gradients(model, variables);
 names = ["omega_x1_00", "theta_x1x1_00"];
@@ -1156,6 +1182,43 @@ for i = 1:2
     for key = model.variableKeys
         key = char(key);
         projected.(key) = projected.(key) - correction(i) * gauge_gradient.(key);
+    end
+end
+end
+
+function projected = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner)
+% Build d = -B(g + A*lambda), with A' d = 0 and g' d <= 0.
+
+gauges = gauge_gradients(model, variables);
+names = ["omega_x1_00", "theta_x1x1_00"];
+preconditionedGradient = apply_rowband_preconditioner(gradient, preconditioner, model.variableKeys);
+projected = scale_variables(preconditionedGradient, -1.0, model.variableKeys);
+
+preconditionedGauges = struct();
+for i = 1:2
+    preconditionedGauges.(names(i)) = apply_rowband_preconditioner( ...
+        gauges.(names(i)), preconditioner, model.variableKeys);
+end
+
+gram = zeros(2, 2);
+rhs = zeros(2, 1);
+for i = 1:2
+    rhs(i) = variable_dot(gauges.(names(i)), projected, model.variableKeys);
+    for j = 1:2
+        gram(i, j) = variable_dot(gauges.(names(i)), preconditionedGauges.(names(j)), model.variableKeys);
+    end
+end
+if cond(gram) > 1.0e14
+    correction = pinv(gram) * rhs;
+else
+    correction = gram \ rhs;
+end
+
+for i = 1:2
+    gauge_step = preconditionedGauges.(names(i));
+    for key = model.variableKeys
+        key = char(key);
+        projected.(key) = projected.(key) - correction(i) * gauge_step.(key);
     end
 end
 end
@@ -1380,13 +1443,17 @@ summary.objective_components = components;
 summary.objective_component_changes = subtract_component_structs(components, base_components);
 end
 
-function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals, mode, searchStepScale, components, stepSearchMode, stepMultiplier, trialCount)
+function row = history_row(iteration, value, objective_change, accepted_step, gradient_norm, projected_gradient_norm, directional_derivative, gauge_errors, residuals, mode, searchStepScale, components, stepSearchMode, stepMultiplier, trialCount, variables)
 % CSV-friendly record for one accepted step.
 
 row = struct();
 row.iteration = iteration;
 row.objective = value;
 row.objective_change = objective_change;
+row.cl = variables.cl;
+row.cw = variables.cw;
+row.rat = variables.rat;
+row.cl_over_cw = variables.cl / variables.cw;
 row.accepted_step = accepted_step;
 row.gradient_norm = gradient_norm;
 row.projected_gradient_norm = projected_gradient_norm;
@@ -1407,6 +1474,16 @@ row.fomega_loss = components.fomega;
 row.fzeta_loss = components.fzeta;
 row.divergence_loss = components.divergence;
 row.curl_loss = components.curl;
+end
+
+function out = scalar_summary(variables)
+% Scalar coefficients tracked alongside the rank-factor arrays.
+
+out = struct();
+out.cl = variables.cl;
+out.cw = variables.cw;
+out.rat = variables.rat;
+out.cl_over_cw = variables.cl / variables.cw;
 end
 
 function out = subtract_component_structs(left, right)
@@ -1559,8 +1636,7 @@ output.final_residual_rms = current_residuals;
 output.gauge_targets = model.gaugeTargets;
 output.gauge_errors_before = initial_gauge_errors;
 output.gauge_errors_after = current_gauge_errors;
-output.rowband_use_natural_step = opts.rowbandUseNaturalStep;
-output.include_extra_shrinks = opts.includeExtraShrinks;
+output.gauge_projection = gauge_projection_for_mode(opts.mode);
 output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;

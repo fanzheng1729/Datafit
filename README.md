@@ -142,9 +142,10 @@ the other row-band defaults:
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2);"
 ```
 
-The wrapper defaults to `Mode = rowband_all`, `ConstraintWeight = 0.007`,
-`MaxIterations = 30`, `NoExtraShrinks = true`, and
-`RowbandUseNaturalStep = true`. It also uses `StepSweepInitialIterations = 5`,
+The wrapper defaults to `Mode = rowband_all`, `ConstraintWeight = 0.007`, and
+`MaxIterations = 30`. Row-band modes always start the line search from the
+measured natural row-band direction norm and use the standard seven-point
+multiplier ladder. The wrapper also uses `StepSweepInitialIterations = 5`,
 `StepSweepPeriod = 5`, and `StepSweepMode = "neighbor"`. On scheduled sweep
 iterations, the optimizer starts from the last accepted step multiplier, tests
 the adjacent larger/smaller multipliers on the ladder, and keeps walking only
@@ -194,17 +195,6 @@ place:
 ```powershell
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'StatePath','matlab_long_rowband_checkpoint_state.mat','InitialStepMultiplier',0.01,'OutputPrefix','matlab_long_rowband_resume');"
 ```
-
-Extending the neighbor walk below the original ladder with
-`IncludeExtraShrinks = true` changed the later trajectory but did not improve
-the 30-step result. The run switched from multiplier `0.01` to `0.003` at
-iteration 25, used 55 candidate evaluations, and ended at
-`J = 0.4763737743`. The smaller step was locally better at iteration 25, but
-then produced smaller follow-up decreases than staying at `0.01`, so extra
-shrinks remain an experiment rather than the default. A 60-step comparison
-confirmed the same trend: the default ladder stayed at `0.01` and reached
-`J = 0.4726382314`, while the extended ladder stayed at `0.003` after
-iteration 25 and reached `J = 0.4745918786`.
 
 ## Run Python
 

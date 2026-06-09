@@ -60,6 +60,9 @@ Current defaults are:
 - `--step-sweep-period 5`
 - `--step-sweep-mode neighbor`
 
+Row-band modes use the measured natural direction norm with the standard
+seven-point multiplier ladder.
+
 The retained Python result artifacts aligned with this path are:
 
 - `from_begin_initial_state.npz`
