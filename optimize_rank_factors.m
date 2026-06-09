@@ -16,7 +16,6 @@ fprintf("  max iterations:           %d\n", opts.maxIterations);
 fprintf("  output prefix:            %s\n", opts.outputPrefix);
 fprintf("  mode:                     %s\n", opts.mode);
 fprintf("  constraint weight:        %.12g\n", opts.constraintWeight);
-fprintf("  parallel candidates:      %d\n", opts.useParallel);
 fprintf("  step sweep warmup:        %d\n", opts.stepSweepInitialIterations);
 fprintf("  step sweep period:        %d\n", opts.stepSweepPeriod);
 fprintf("  step sweep mode:          %s\n", opts.stepSweepMode);
@@ -200,7 +199,6 @@ output.gauge_projection = gauge_projection_for_mode(opts.mode);
 output.last_gradient_norm = last_gradient_norm;
 output.last_projected_gradient_norm = last_projected_gradient_norm;
 output.last_directional_derivative = last_directional_derivative;
-output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
 output.initial_step_multiplier = opts.initialStepMultiplier;
@@ -253,7 +251,6 @@ opts.minObjectiveDecrease = 1.0e-10;
 opts.gaugeTolerance = 1.0e-8;
 opts.initialStepScale = 3.0e-16;
 opts.stepMultipliers = [10.0, 3.0, 1.0, 0.3, 0.1, 0.03, 0.01];
-opts.useParallel = false;
 opts.stepSweepInitialIterations = 0;
 opts.stepSweepPeriod = 1;
 opts.stepSweepMode = "full";
@@ -283,7 +280,7 @@ for k = 1:2:numel(varargin)
             opts.mode = lower(string(value));
         case {"statepath", "state"}
             opts.statePath = string(value);
-        case {"rowbanddiagnostic", "pqdiagnostic"}
+        case "rowbanddiagnostic"
             opts.rowbandDiagnostic = string(value);
         case "constraintweight"
             opts.constraintWeight = value;
@@ -295,8 +292,6 @@ for k = 1:2:numel(varargin)
             opts.initialStepScale = value;
         case "stepmultipliers"
             opts.stepMultipliers = value;
-        case "useparallel"
-            opts.useParallel = logical_option(value);
         case {"stepsweepinitialiterations", "initialstepsweeps", "stepsweepwarmup"}
             opts.stepSweepInitialIterations = value;
         case {"stepsweepperiod", "stepsweepevery"}
@@ -319,7 +314,7 @@ end
 if opts.maxIterations < 1 || opts.maxIterations ~= floor(opts.maxIterations)
     error("MaxIterations must be a positive integer.");
 end
-valid_modes = ["vanilla", "raw_pq", "raw_all", "rowband_pq", "rowband_all"];
+valid_modes = ["vanilla", "raw_all", "rowband_all"];
 if ~any(opts.mode == valid_modes)
     error("Unknown optimizer mode: %s", opts.mode);
 end
@@ -480,15 +475,9 @@ end
 diagnostic = jsondecode(fileread(path));
 end
 
-function blocks = pq_target_blocks()
-% Velocity P/Q blocks used by the first pushed row-band experiment.
-
-blocks = ["u1_P", "u1_Q", "u2_P", "u2_Q"];
-end
-
 function blocks = target_blocks_for_mode(mode, diagnostic)
-% Keep P/Q modes backward-compatible and let all-variable modes follow the
-% diagnostic that recorded which P/Q/s/scalar groups were actually probed.
+% Let all-variable modes follow the diagnostic that recorded which groups were
+% actually probed.
 
 mode = string(mode);
 if mode == "raw_all" || mode == "rowband_all"
@@ -497,7 +486,7 @@ if mode == "raw_all" || mode == "rowband_all"
         blocks = [blocks, "rat"];
     end
 else
-    blocks = pq_target_blocks();
+    blocks = strings(1, 0);
 end
 end
 
@@ -562,9 +551,9 @@ preconditioner = [];
 switch mode
     case "vanilla"
         direction = scale_variables(gradient, -1.0, model.variableKeys);
-    case {"raw_pq", "raw_all"}
+    case "raw_all"
         direction = selected_raw_direction(variables, gradient, targetBlocks, model.variableKeys);
-    case {"rowband_pq", "rowband_all"}
+    case "rowband_all"
         preconditioner = rowband_preconditioner(gradient, diagnostic, targetBlocks, model.variableKeys);
         direction = scale_variables( ...
             apply_rowband_preconditioner(gradient, preconditioner, model.variableKeys), ...
@@ -1391,32 +1380,16 @@ steps = line_search_steps(searchStepScale, stepMultipliers);
 candidate_summaries = cell(numel(steps), 1);
 candidate_variables = cell(numel(steps), 1);
 candidate_evaluations = cell(numel(steps), 1);
-if opts.useParallel
-    parfor k = 1:numel(steps)
-        % Each trial is retracted after stepping so P/Q/S return to the
-        % orthonormal chart before the objective and gauge checks are made.
-        [summary, candidate, candidate_evaluation] = candidate_summary( ...
-            model, variables, direction, steps(k), baseObjective, baseComponents, opts);
-        summary.iteration = iteration;
-        summary.step_multiplier = stepMultipliers(k);
-        summary.step_multiplier_index = stepMultiplierIndices(k);
-        summary.step_search_mode = stepSearchMode;
-        candidate_summaries{k} = summary;
-        candidate_variables{k} = candidate;
-        candidate_evaluations{k} = candidate_evaluation;
-    end
-else
-    for k = 1:numel(steps)
-        [summary, candidate, candidate_evaluation] = candidate_summary( ...
-            model, variables, direction, steps(k), baseObjective, baseComponents, opts);
-        summary.iteration = iteration;
-        summary.step_multiplier = stepMultipliers(k);
-        summary.step_multiplier_index = stepMultiplierIndices(k);
-        summary.step_search_mode = stepSearchMode;
-        candidate_summaries{k} = summary;
-        candidate_variables{k} = candidate;
-        candidate_evaluations{k} = candidate_evaluation;
-    end
+for k = 1:numel(steps)
+    [summary, candidate, candidate_evaluation] = candidate_summary( ...
+        model, variables, direction, steps(k), baseObjective, baseComponents, opts);
+    summary.iteration = iteration;
+    summary.step_multiplier = stepMultipliers(k);
+    summary.step_multiplier_index = stepMultiplierIndices(k);
+    summary.step_search_mode = stepSearchMode;
+    candidate_summaries{k} = summary;
+    candidate_variables{k} = candidate;
+    candidate_evaluations{k} = candidate_evaluation;
 end
 candidates = [candidate_summaries{:}];
 end
@@ -1637,7 +1610,6 @@ output.gauge_targets = model.gaugeTargets;
 output.gauge_errors_before = initial_gauge_errors;
 output.gauge_errors_after = current_gauge_errors;
 output.gauge_projection = gauge_projection_for_mode(opts.mode);
-output.use_parallel = opts.useParallel;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 output.initial_step_scale = opts.initialStepScale;
 output.initial_step_multiplier = opts.initialStepMultiplier;

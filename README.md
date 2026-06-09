@@ -163,20 +163,9 @@ To restore the old full-sweep behavior, set `StepSweepMode` to `"full"` and
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(30,'StepSweepMode','full','StepSweepPeriod',1);"
 ```
 
-Candidate line-search steps can be evaluated with MATLAB `parfor` when
-Parallel Computing Toolbox is installed:
-
-```powershell
-matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2,'UseParallel',true);"
-```
-
-`UseParallel` defaults to `false`. On the current 7-candidate line search,
-serial evaluation was slightly faster than a warmed 4-worker process pool, so
-parallel mode is mainly an optional experiment for heavier candidate workloads.
-The neighbor scheduled-sweep policy is the recommended serial path. With the
-updated weight-`0.007` diagnostic, the matching Python saved-state check
-reduced `J` from `1.0070000000` to `0.1807256857` before the next line-search
-bracket stopped.
+With the updated weight-`0.007` diagnostic, the matching Python saved-state
+check reduced `J` from `1.0070000000` to `0.1807256857` before the next
+line-search bracket stopped.
 
 For long MATLAB runs, enable periodic checkpointing:
 
@@ -262,16 +251,16 @@ for the rat-enabled all-variable row-band path:
   Its defaults are `rowband_all`, constraint weight `0.007`,
   `from_begin_initial_state.npz`, and
   `all_variable_rowband_step_scaling_diagnostic_results.json`.
-- `diagnose_pq_support_step_scaling.py` regenerates row-band safe-step
-  diagnostics. Its default target scope is now `all`, including `rat`.
+- `diagnose_pq_support_step_scaling.py` regenerates the all-variable row-band
+  safe-step diagnostic, including `rat`.
 - `gradient_check_rank.py`, `check_retraction_refit.py`, and
   `test_gradient_direction_signs.py` are retained as sanity checks for the
   shared model and chart mechanics.
 - `rank_factor_tools.py`, `runfit.py`, and `local_deps.py` provide the reusable
   rank-chart, MATLAB-data, and local-dependency support.
 
-The older vanilla-gradient, L-BFGS, curl-trust, damped-curl, P/Q-only result,
-and profile-pilot Python files have been removed from the active workspace.
+The older vanilla-gradient, L-BFGS, curl-trust, damped-curl, and profile-pilot
+Python files have been removed from the active workspace.
 
 ### Run the Python Row-Band Check
 

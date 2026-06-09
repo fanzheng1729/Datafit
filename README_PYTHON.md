@@ -39,9 +39,9 @@ row-band experiment:
 - `rank_factor_tools.py`, `runfit.py`, and `local_deps.py`: shared numerical
   support.
 
-Old standalone vanilla-gradient, L-BFGS, curl-trust, damped-curl, P/Q-only
-artifact, and low-dimensional profile-pilot files have been removed from the
-active Python side.
+Old standalone vanilla-gradient, L-BFGS, curl-trust, damped-curl, and
+low-dimensional profile-pilot files have been removed from the active Python
+side.
 
 ## Run
 
@@ -55,7 +55,7 @@ Current defaults are:
 - `--constraint-weight 0.007`
 - `--max-iterations 30`
 - `--state from_begin_initial_state.npz`
-- `--pq-diagnostic all_variable_rowband_step_scaling_diagnostic_results.json`
+- `--rowband-diagnostic all_variable_rowband_step_scaling_diagnostic_results.json`
 - `--step-sweep-initial-iterations 5`
 - `--step-sweep-period 5`
 - `--step-sweep-mode neighbor`

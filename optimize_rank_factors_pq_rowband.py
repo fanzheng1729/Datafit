@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """Run row-band-scaled optimizer steps from a saved state.
 
-This experiment starts from an existing optimizer state and runs one of:
-
-* ``vanilla``: the full negative analytic gradient, as in the plain optimizer.
-* ``raw_pq``: legacy raw negative gradient on u1/u2 P/Q blocks.
-* ``rowband_pq``: legacy u1/u2 P/Q blocks, with each coordinate row band scaled
-  by the largest accepted unit step measured by
-  ``diagnose_pq_support_step_scaling.py``.
-* ``rowband_all``: every optimized variable, using row bands for P/Q blocks and
-  one measured block scale for non-spatial ``s``, ``cl``, ``cw``, and ``rat``
-  variables.
+This experiment starts from an existing optimizer state and runs the
+all-variable row-band path, plus full-variable raw/vanilla controls.
 
 The objective itself is unchanged.  Every trial point is retracted/refit before
 evaluation, exactly like the existing monitored optimizer.
@@ -60,11 +52,6 @@ DEFAULT_ROWBAND_DIAGNOSTIC = Path("all_variable_rowband_step_scaling_diagnostic_
 DEFAULT_OUTPUT_PREFIX = "rowband_all_rank_optimization"
 DEFAULT_CONSTRAINT_WEIGHT = 0.007
 
-# The legacy row-band P/Q mode uses only velocity P/Q coefficient blocks.
-# ``rowband_all`` reads target_blocks from an all-variable diagnostic JSON.
-PQ_TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
-
-
 def load_state(path: Path) -> VariableDict:
     """Load a saved optimizer state produced by ``save_state``."""
 
@@ -109,16 +96,14 @@ def zero_like_variables(variables: VariableDict) -> VariableDict:
     }
 
 
-def target_blocks_from_diagnostic(pq_diagnostic: dict[str, Any]) -> tuple[str, ...]:
+def target_blocks_from_diagnostic(rowband_diagnostic: dict[str, Any]) -> tuple[str, ...]:
     """Read target blocks from a diagnostic JSON.
 
-    For ``rowband_pq`` the target list is hard-coded for backward
-    compatibility with the legacy P/Q result. For ``rowband_all`` the
-    diagnostic is authoritative because it records exactly which P/Q/s/scalar
+    The diagnostic is authoritative because it records exactly which P/Q/s/scalar
     groups were probed and should therefore be moved.
     """
 
-    target_blocks = pq_diagnostic.get("target_blocks")
+    target_blocks = rowband_diagnostic.get("target_blocks")
     if not target_blocks:
         raise ValueError("row-band diagnostic does not contain target_blocks")
     blocks = [str(block) for block in target_blocks]
@@ -193,7 +178,7 @@ def apply_safe_step_to_group(
 def rowband_direction(
     variables: VariableDict,
     gradient: VariableDict,
-    pq_diagnostic: dict[str, Any],
+    rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
 ) -> VariableDict:
     """Build the measured row-band-scaled descent direction.
@@ -212,10 +197,10 @@ def rowband_direction(
             block_direction = np.zeros_like(block_gradient)
         else:
             block_direction = 0.0
-        if block not in pq_diagnostic["block_results"]:
+        if block not in rowband_diagnostic["block_results"]:
             if isinstance(block_gradient, np.ndarray):
                 raise KeyError(f"row-band diagnostic does not contain block {block}")
-            safe_step = fallback_scalar_safe_step(pq_diagnostic)
+            safe_step = fallback_scalar_safe_step(rowband_diagnostic)
             direction[block] = apply_safe_step_to_group(
                 block_direction,
                 block_gradient,
@@ -223,7 +208,7 @@ def rowband_direction(
                 safe_step,
             )
             continue
-        for group in pq_diagnostic["block_results"][block]["groups"]:
+        for group in rowband_diagnostic["block_results"][block]["groups"]:
             safe_step = group["trial_summary"]["largest_accepted_step"]
             if safe_step is None:
                 continue
@@ -245,12 +230,12 @@ def rowband_direction(
     return direction
 
 
-def fallback_scalar_safe_step(pq_diagnostic: dict[str, Any]) -> float:
+def fallback_scalar_safe_step(rowband_diagnostic: dict[str, Any]) -> float:
     """Use the safest measured scalar-rate step for newly added scalars."""
 
     steps: list[float] = []
     for block in ("cl", "cw"):
-        block_result = pq_diagnostic.get("block_results", {}).get(block)
+        block_result = rowband_diagnostic.get("block_results", {}).get(block)
         if not block_result:
             continue
         for group in block_result["groups"]:
@@ -264,30 +249,24 @@ def raw_direction_for_mode(
     mode: str,
     variables: VariableDict,
     gradient: VariableDict,
-    pq_diagnostic: dict[str, Any] | None,
+    rowband_diagnostic: dict[str, Any] | None,
 ) -> VariableDict:
     """Select the raw direction family requested by ``--mode``."""
 
     if mode == "vanilla":
         return negative_gradient(gradient)
-    if mode == "raw_pq":
-        return selected_raw_direction(variables, gradient, PQ_TARGET_BLOCKS)
     if mode == "raw_all":
-        if pq_diagnostic is None:
+        if rowband_diagnostic is None:
             raise ValueError("raw_all mode requires a diagnostic JSON with target_blocks")
-        return selected_raw_direction(variables, gradient, target_blocks_from_diagnostic(pq_diagnostic))
-    if mode == "rowband_pq":
-        if pq_diagnostic is None:
-            raise ValueError("rowband_pq mode requires a P/Q diagnostic JSON")
-        return rowband_direction(variables, gradient, pq_diagnostic, PQ_TARGET_BLOCKS)
+        return selected_raw_direction(variables, gradient, target_blocks_from_diagnostic(rowband_diagnostic))
     if mode == "rowband_all":
-        if pq_diagnostic is None:
+        if rowband_diagnostic is None:
             raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
         return rowband_direction(
             variables,
             gradient,
-            pq_diagnostic,
-            target_blocks_from_diagnostic(pq_diagnostic),
+            rowband_diagnostic,
+            target_blocks_from_diagnostic(rowband_diagnostic),
         )
     raise ValueError(f"unknown mode: {mode}")
 
@@ -532,7 +511,7 @@ def run_optimizer(
     *,
     mode: str,
     state_path: Path,
-    pq_diagnostic_path: Path | None,
+    rowband_diagnostic_path: Path | None,
     max_iterations: int,
     output_prefix: str,
     initial_step_scale: float,
@@ -545,9 +524,8 @@ def run_optimizer(
 ) -> dict[str, Any]:
     """Run a saved-state optimizer comparison.
 
-    ``vanilla``, ``raw_pq``, and ``raw_all`` modes are controls.  ``rowband_pq``
-    reproduces the older P/Q-only experiment.  ``rowband_all`` is the current
-    recommended all-variable row-band setup.
+    ``vanilla`` and ``raw_all`` modes are controls. ``rowband_all`` is the
+    current recommended all-variable row-band setup.
 
     The objective and acceptance logic are deliberately unchanged across modes
     so the resulting JSON/CSV files differ only by the direction family and the
@@ -569,9 +547,9 @@ def run_optimizer(
     variables = model.complete_variables(load_state(state_path))
     # Only row-band mode needs the diagnostic, but accepting an optional path
     # keeps the JSON output comparable across modes.
-    pq_diagnostic = None
-    if pq_diagnostic_path is not None and pq_diagnostic_path.exists():
-        pq_diagnostic = json.loads(pq_diagnostic_path.read_text(encoding="utf-8"))
+    rowband_diagnostic = None
+    if rowband_diagnostic_path is not None and rowband_diagnostic_path.exists():
+        rowband_diagnostic = json.loads(rowband_diagnostic_path.read_text(encoding="utf-8"))
 
     current_evaluation = model.evaluate(variables)
     initial_objective = model.objective_from_residuals(current_evaluation.residuals)
@@ -590,7 +568,7 @@ def run_optimizer(
         base_objective = model.objective_from_residuals(current_evaluation.residuals)
         base_components = objective_components(model, current_evaluation.residuals)
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
-        raw_direction = raw_direction_for_mode(mode, variables, gradient, pq_diagnostic)
+        raw_direction = raw_direction_for_mode(mode, variables, gradient, rowband_diagnostic)
         tangent_direction = model.projected_tangent_direction(variables, raw_direction)
         direction, direction_norm_before_normalization = normalize_direction(tangent_direction)
         gradient_norm = variable_norm(gradient)
@@ -726,11 +704,11 @@ def run_optimizer(
         save_state(paths["state"], variables)
 
     return {
-        "description": "Saved-state rank-factor optimizer comparison with optional P/Q row-band direction scaling.",
+        "description": "Saved-state rank-factor optimizer comparison with all-variable row-band direction scaling.",
         "mode": mode,
         "constraint_weight": constraint_weight,
         "state_path": str(state_path),
-        "pq_diagnostic_path": str(pq_diagnostic_path) if pq_diagnostic_path is not None else None,
+        "rowband_diagnostic_path": str(rowband_diagnostic_path) if rowband_diagnostic_path is not None else None,
         "accepted_steps": accepted_count,
         "state_file": paths["state"].name if accepted_count > 0 else None,
         "history_file": paths["history"].name,
@@ -757,9 +735,9 @@ def run_optimizer(
         "min_objective_decrease": MIN_OBJECTIVE_DECREASE,
         "gauge_tolerance": GAUGE_TOLERANCE,
         "target_blocks": (
-            target_blocks_from_diagnostic(pq_diagnostic)
-            if pq_diagnostic is not None and mode in ("rowband_all", "raw_all")
-            else PQ_TARGET_BLOCKS
+            target_blocks_from_diagnostic(rowband_diagnostic)
+            if rowband_diagnostic is not None and mode in ("rowband_all", "raw_all")
+            else ()
         ),
         "ranks": {core.name: int(core.rank) for core in model.cores},
         "history": history,
@@ -773,11 +751,11 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("vanilla", "raw_pq", "raw_all", "rowband_pq", "rowband_all"),
+        choices=("vanilla", "raw_all", "rowband_all"),
         default="rowband_all",
     )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--pq-diagnostic", type=Path, default=DEFAULT_ROWBAND_DIAGNOSTIC)
+    parser.add_argument("--rowband-diagnostic", type=Path, default=DEFAULT_ROWBAND_DIAGNOSTIC)
     parser.add_argument("-n", "--max-iterations", type=int, default=30)
     parser.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX)
     parser.add_argument("--initial-step-scale", type=float, default=INITIAL_STEP_SCALE)
@@ -822,7 +800,7 @@ def main(argv: list[str] | None = None) -> int:
     output = run_optimizer(
         mode=args.mode,
         state_path=args.state,
-        pq_diagnostic_path=args.pq_diagnostic,
+        rowband_diagnostic_path=args.rowband_diagnostic,
         max_iterations=args.max_iterations,
         output_prefix=args.output_prefix,
         initial_step_scale=args.initial_step_scale,

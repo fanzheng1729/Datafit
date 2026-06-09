@@ -9,10 +9,9 @@ power law
 
     safe_step ~= C * (1 + axis_coordinate^2)^alpha
 
-for each spatial P/Q block.  With the default ``--target-scope all`` it also
-probes the non-spatial ``s``, ``cl``, ``cw``, and ``rat`` variables as single
-blocks so an optimizer can move every variable while still using measured safe
-scales.
+for each spatial P/Q block. It also probes the non-spatial ``s``, ``cl``,
+``cw``, and ``rat`` variables as single blocks so an optimizer can move every
+variable while still using measured safe scales.
 """
 
 from __future__ import annotations
@@ -80,7 +79,6 @@ DEFAULT_STEPS = [
     1.0e-19,
 ]
 DEFAULT_AXIS_EDGES = [0.02, 0.1, 1.0, 10.0, 100.0, 1.0e4, 1.0e8, 1.0e12]
-PQ_TARGET_BLOCKS = ("u1_P", "u1_Q", "u2_P", "u2_Q")
 
 
 def parse_steps(raw: str | None) -> list[float]:
@@ -213,21 +211,6 @@ def all_target_blocks(model: RankOptimizationModel) -> tuple[str, ...]:
         blocks.extend([core.p_key, core.q_key, core.s_key])
     blocks.extend(["cl", "cw", "rat"])
     return tuple(blocks)
-
-
-def target_blocks_for_scope(model: RankOptimizationModel, scope: str) -> tuple[str, ...]:
-    """Resolve a user-facing target scope into concrete variable blocks.
-
-    ``pq`` preserves the legacy velocity-only scope. ``all`` is the current
-    rat-enabled scope, and is the diagnostic consumed by
-    ``optimize_rank_factors_pq_rowband.py --mode rowband_all``.
-    """
-
-    if scope == "pq":
-        return PQ_TARGET_BLOCKS
-    if scope == "all":
-        return all_target_blocks(model)
-    raise ValueError(f"unknown target scope: {scope}")
 
 
 def variable_shape(value: np.ndarray | float) -> list[int]:
@@ -635,12 +618,6 @@ def parse_args() -> Namespace:
     parser.add_argument("--constraint-weight", type=float, default=CONSTRAINT_WEIGHT)
     parser.add_argument("--steps", type=str, default=None)
     parser.add_argument("--axis-edges", type=str, default=None)
-    parser.add_argument(
-        "--target-scope",
-        choices=("pq", "all"),
-        default="all",
-        help="all probes every optimizer variable; pq keeps the old velocity P/Q-only diagnostic",
-    )
     return parser.parse_args()
 
 
@@ -654,7 +631,7 @@ def main() -> None:
     base_components = objective_components(model, evaluation.residuals)
     steps = parse_steps(args.steps)
     edges = parse_edges(args.axis_edges)
-    target_blocks = target_blocks_for_scope(model, args.target_scope)
+    target_blocks = all_target_blocks(model)
 
     block_results: dict[str, Any] = {}
     for block in target_blocks:
@@ -689,7 +666,6 @@ def main() -> None:
         "gradient_blocks": variable_block_summary(gradient),
         "steps": steps,
         "axis_edges": edges,
-        "target_scope": args.target_scope,
         "target_blocks": target_blocks,
         "block_results": block_results,
     }
