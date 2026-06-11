@@ -1242,13 +1242,13 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     parser.add_argument(
         "--step-sweep-initial-iterations",
         type=int,
-        default=5,
+        default=2,
         help="number of initial iterations that search around the step multiplier",
     )
     parser.add_argument(
         "--step-sweep-period",
         type=int,
-        default=5,
+        default=20,
         help="after warmup, search around the step multiplier every N iterations",
     )
     parser.add_argument(
