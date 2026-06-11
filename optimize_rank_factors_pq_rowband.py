@@ -2,7 +2,9 @@
 """Run row-band-scaled optimizer steps from a saved state.
 
 This experiment starts from an existing optimizer state and runs the
-all-variable row-band path, plus full-variable raw/vanilla controls.
+all-variable row-band path, plus full-variable raw/vanilla controls.  The
+row-band path uses direct scalar-gradient multiplier sweeps for cl/cw/rat and
+measured row-band scaling for field blocks.
 
 The objective itself is unchanged.  Every trial point is retracted/refit before
 evaluation, exactly like the existing monitored optimizer.
@@ -51,6 +53,47 @@ DEFAULT_STATE = Path("from_begin_initial_state.npz")
 DEFAULT_ROWBAND_DIAGNOSTIC = Path("all_variable_rowband_step_scaling_diagnostic_results.json")
 DEFAULT_OUTPUT_PREFIX = "rowband_all_rank_optimization"
 DEFAULT_CONSTRAINT_WEIGHT = 0.007
+SCALAR_BLOCKS = ("cl", "cw", "rat")
+DIRECT_FIELD_MULTIPLIERS = [
+    10.0,
+    3.0,
+    1.0,
+    0.3,
+    0.1,
+    0.03,
+    0.01,
+    0.003,
+    0.001,
+    0.0003,
+    0.0001,
+    0.00003,
+    0.00001,
+]
+DIRECT_SCALAR_MULTIPLIERS = [
+    0.0,
+    1.0e-15,
+    3.0e-15,
+    1.0e-14,
+    3.0e-14,
+    1.0e-13,
+    3.0e-13,
+    1.0e-12,
+    3.0e-12,
+    1.0e-11,
+    3.0e-11,
+    1.0e-10,
+    3.0e-10,
+    1.0e-9,
+    3.0e-9,
+    1.0e-8,
+    3.0e-8,
+    1.0e-7,
+    3.0e-7,
+    1.0e-6,
+    3.0e-6,
+    1.0e-5,
+]
+
 
 def load_state(path: Path) -> VariableDict:
     """Load a saved optimizer state produced by ``save_state``."""
@@ -254,6 +297,77 @@ def fallback_scalar_safe_step(rowband_diagnostic: dict[str, Any]) -> float:
             if safe_step is not None and safe_step > 0.0:
                 steps.append(float(safe_step))
     return min(steps) if steps else 1.0e-7
+
+
+def effective_direct_field_multipliers() -> list[float]:
+    """Return the row-band field multiplier ladder for direct scalar sweeps."""
+
+    return list(DIRECT_FIELD_MULTIPLIERS)
+
+
+def effective_direct_scalar_multipliers() -> list[float]:
+    """Return absolute scalar-gradient preconditioner multipliers."""
+
+    return list(DIRECT_SCALAR_MULTIPLIERS)
+
+
+def rowband_direct_base_preconditioner(
+    variables: VariableDict,
+    gradient: VariableDict,
+    rowband_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
+) -> VariableDict:
+    """Build the row-band field metric with scalar movement disabled."""
+
+    preconditioner = rowband_preconditioner(variables, gradient, rowband_diagnostic, target_blocks)
+    for key in SCALAR_BLOCKS:
+        if key in preconditioner:
+            preconditioner[key] = 0.0
+    return preconditioner
+
+
+def rowband_direct_preconditioner(
+    base_preconditioner: VariableDict,
+    multipliers: dict[str, float],
+) -> VariableDict:
+    """Apply a field multiplier plus direct scalar-gradient multipliers."""
+
+    out = copy_variables(base_preconditioner)
+    field_multiplier = float(multipliers["field"])
+    for key, value in out.items():
+        if isinstance(value, np.ndarray):
+            out[key] = field_multiplier * value
+    for key in SCALAR_BLOCKS:
+        out[key] = float(multipliers.get(key, 0.0))
+    return out
+
+
+def direct_multiplier_tuple(field: float, scalars: dict[str, float] | None = None) -> dict[str, float]:
+    """Normalize direct row-band multiplier dictionaries for JSON/history."""
+
+    scalars = scalars or {}
+    return {
+        "field": float(field),
+        "cl": float(scalars.get("cl", 0.0)),
+        "cw": float(scalars.get("cw", 0.0)),
+        "rat": float(scalars.get("rat", 0.0)),
+    }
+
+
+def nearest_direct_multiplier_index(ladder: list[float], value: float) -> int:
+    """Return the nearest direct multiplier index, allowing the zero endpoint."""
+
+    if value <= 0.0:
+        return 0
+    positive = [
+        (index, multiplier)
+        for index, multiplier in enumerate(ladder)
+        if multiplier > 0.0
+    ]
+    return min(
+        positive,
+        key=lambda item: abs(np.log(item[1]) - np.log(value)),
+    )[0]
 
 
 def raw_direction_for_mode(
@@ -462,6 +576,221 @@ def candidate_with_components(
     return summary, candidate, evaluation
 
 
+def direct_candidate_with_components(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    base_preconditioner: VariableDict,
+    multipliers: dict[str, float],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+    step_search_mode: str,
+) -> tuple[dict[str, Any], VariableDict, Evaluation] | None:
+    """Evaluate one direct-scalar row-band multiplier tuple."""
+
+    preconditioner = rowband_direct_preconditioner(base_preconditioner, multipliers)
+    tangent_direction = preconditioned_projected_tangent_direction(
+        model,
+        variables,
+        gradient,
+        preconditioner,
+    )
+    direction, direction_norm = normalize_direction(tangent_direction)
+    if direction_norm == 0.0:
+        return None
+    directional_derivative = variable_dot(gradient, direction)
+    if not np.isfinite(directional_derivative) or directional_derivative >= 0.0:
+        return None
+    summary, candidate, evaluation = candidate_with_components(
+        model,
+        variables,
+        direction,
+        direction_norm,
+        base_objective,
+        base_components,
+    )
+    summary["iteration"] = iteration
+    summary["step_multiplier"] = float(multipliers["field"])
+    summary["step_multiplier_index"] = nearest_step_multiplier_index(
+        effective_direct_field_multipliers(),
+        float(multipliers["field"]),
+    )
+    summary["step_search_mode"] = step_search_mode
+    summary["rowband_direct_multipliers"] = {
+        key: float(multipliers[key])
+        for key in ("field", *SCALAR_BLOCKS)
+    }
+    summary["field_step_multiplier"] = float(multipliers["field"])
+    for key in SCALAR_BLOCKS:
+        summary[f"{key}_direct_multiplier"] = float(multipliers[key])
+    summary["directional_derivative"] = float(directional_derivative)
+    return summary, candidate, evaluation
+
+
+def evaluate_direct_tuple_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    base_preconditioner: VariableDict,
+    multiplier_tuples: list[dict[str, float]],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+    step_search_mode: str,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Evaluate direct row-band tuples, skipping non-descent degeneracies."""
+
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    for multipliers in multiplier_tuples:
+        key = tuple(float(multipliers[name]) for name in ("field", *SCALAR_BLOCKS))
+        if key in seen:
+            continue
+        seen.add(key)
+        result = direct_candidate_with_components(
+            model=model,
+            variables=variables,
+            gradient=gradient,
+            base_preconditioner=base_preconditioner,
+            multipliers=multipliers,
+            base_objective=base_objective,
+            base_components=base_components,
+            iteration=iteration,
+            step_search_mode=step_search_mode,
+        )
+        if result is None:
+            continue
+        summary, candidate, evaluation = result
+        candidates.append(summary)
+        candidate_variables.append(candidate)
+        candidate_evaluations.append(evaluation)
+    return candidates, candidate_variables, candidate_evaluations
+
+
+def direct_candidate_multipliers(candidate: dict[str, Any]) -> dict[str, float]:
+    """Extract a direct multiplier tuple from a candidate summary."""
+
+    values = candidate["rowband_direct_multipliers"]
+    return {
+        key: float(values[key])
+        for key in ("field", *SCALAR_BLOCKS)
+    }
+
+
+def rowband_direct_coordinate_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    rowband_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
+    field_multipliers: list[float],
+    scalar_multipliers: list[float],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+    step_search_mode: str,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Field-only seed, then direct cl/cw/rat coordinate refinement."""
+
+    base_preconditioner = rowband_direct_base_preconditioner(
+        variables,
+        gradient,
+        rowband_diagnostic,
+        target_blocks,
+    )
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+
+    seed_tuples = [
+        direct_multiplier_tuple(field_multiplier)
+        for field_multiplier in field_multipliers
+    ]
+    new_candidates, new_variables, new_evaluations = evaluate_direct_tuple_candidates(
+        model=model,
+        variables=variables,
+        gradient=gradient,
+        base_preconditioner=base_preconditioner,
+        multiplier_tuples=seed_tuples,
+        base_objective=base_objective,
+        base_components=base_components,
+        iteration=iteration,
+        step_search_mode=step_search_mode,
+    )
+    candidates.extend(new_candidates)
+    candidate_variables.extend(new_variables)
+    candidate_evaluations.extend(new_evaluations)
+    accepted_index, _ = choose_best_candidate(candidates, candidate_variables)
+    if accepted_index is None:
+        return candidates, candidate_variables, candidate_evaluations
+
+    current_multipliers = direct_candidate_multipliers(candidates[accepted_index])
+    for scalar_key in SCALAR_BLOCKS:
+        trial_tuples = []
+        for scalar_multiplier in scalar_multipliers:
+            trial = dict(current_multipliers)
+            trial[scalar_key] = float(scalar_multiplier)
+            trial_tuples.append(trial)
+        new_candidates, new_variables, new_evaluations = evaluate_direct_tuple_candidates(
+            model=model,
+            variables=variables,
+            gradient=gradient,
+            base_preconditioner=base_preconditioner,
+            multiplier_tuples=trial_tuples,
+            base_objective=base_objective,
+            base_components=base_components,
+            iteration=iteration,
+            step_search_mode=f"{step_search_mode}_{scalar_key}",
+        )
+        candidates.extend(new_candidates)
+        candidate_variables.extend(new_variables)
+        candidate_evaluations.extend(new_evaluations)
+        accepted_index, _ = choose_best_candidate(candidates, candidate_variables)
+        if accepted_index is not None:
+            current_multipliers = direct_candidate_multipliers(candidates[accepted_index])
+
+    return candidates, candidate_variables, candidate_evaluations
+
+
+def rowband_direct_single_candidate(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    rowband_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
+    multipliers: dict[str, float],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Evaluate the trusted direct row-band multiplier tuple once."""
+
+    base_preconditioner = rowband_direct_base_preconditioner(
+        variables,
+        gradient,
+        rowband_diagnostic,
+        target_blocks,
+    )
+    return evaluate_direct_tuple_candidates(
+        model=model,
+        variables=variables,
+        gradient=gradient,
+        base_preconditioner=base_preconditioner,
+        multiplier_tuples=[multipliers],
+        base_objective=base_objective,
+        base_components=base_components,
+        iteration=iteration,
+        step_search_mode="direct_single",
+    )
+
+
 def component_history_fields(components: dict[str, float]) -> dict[str, float]:
     """Flatten component losses into CSV-friendly fields."""
 
@@ -639,6 +968,12 @@ def run_optimizer(
     initial_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     step_scale = initial_step_scale
     last_step_multiplier: float | None = None
+    target_blocks = (
+        target_blocks_from_diagnostic(rowband_diagnostic)
+        if rowband_diagnostic is not None and mode in ("rowband_all", "raw_all")
+        else ()
+    )
+    last_direct_multipliers: dict[str, float] | None = None
 
     history: list[dict[str, float | int | str]] = []
     candidate_history: list[dict[str, Any]] = []
@@ -650,80 +985,125 @@ def run_optimizer(
         base_objective = model.objective_from_residuals(current_evaluation.residuals)
         base_components = objective_components(model, current_evaluation.residuals)
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
-        raw_direction, preconditioner = raw_direction_for_mode(mode, variables, gradient, rowband_diagnostic)
-        tangent_direction = projected_tangent_direction_for_mode(
-            model,
-            variables,
-            gradient,
-            raw_direction,
-            preconditioner,
-        )
-        direction, direction_norm_before_normalization = normalize_direction(tangent_direction)
         gradient_norm = variable_norm(gradient)
-        directional_derivative = variable_dot(gradient, direction)
-        last_projection = gauge_projection_name(preconditioner)
-        if (
-            direction_norm_before_normalization == 0.0
-            or not np.isfinite(directional_derivative)
-            or directional_derivative >= 0.0
-        ):
-            stop_reason = "projected direction was not a descent direction"
-            break
-
-        search_scale = step_scale
-        if mode.startswith("rowband_"):
-            # The row-band direction norm is already in units of "largest safe
-            # unit-band steps", so using it as the line-search scale avoids
-            # collapsing back to the tiny vanilla gradient step size.
-            search_scale = direction_norm_before_normalization
-
-        step_multipliers, step_search_mode, scheduled_sweep = step_multipliers_for_iteration(
-            iteration=iteration,
-            step_sweep_initial_iterations=step_sweep_initial_iterations,
-            step_sweep_period=step_sweep_period,
-            step_sweep_mode=step_sweep_mode,
-            step_sweep_start_multiplier=step_sweep_start_multiplier,
-            last_step_multiplier=last_step_multiplier,
-        )
-        if step_search_mode == "neighbor_sweep":
-            candidates, candidate_variables, candidate_evaluations = evaluate_neighbor_step_candidates(
-                model=model,
-                variables=variables,
-                direction=direction,
-                search_scale=search_scale,
-                initial_multipliers=step_multipliers,
-                base_objective=base_objective,
-                base_components=base_components,
-                iteration=iteration,
+        if mode == "rowband_all":
+            if rowband_diagnostic is None:
+                raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
+            scheduled_sweep = should_sweep_steps(
+                iteration,
+                step_sweep_initial_iterations=step_sweep_initial_iterations,
+                step_sweep_period=step_sweep_period,
             )
+            search_scale = 1.0
+            if scheduled_sweep or last_direct_multipliers is None:
+                candidates, candidate_variables, candidate_evaluations = rowband_direct_coordinate_candidates(
+                    model=model,
+                    variables=variables,
+                    gradient=gradient,
+                    rowband_diagnostic=rowband_diagnostic,
+                    target_blocks=target_blocks,
+                    field_multipliers=effective_direct_field_multipliers(),
+                    scalar_multipliers=effective_direct_scalar_multipliers(),
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                    step_search_mode="direct_sweep",
+                )
+            else:
+                candidates, candidate_variables, candidate_evaluations = rowband_direct_single_candidate(
+                    model=model,
+                    variables=variables,
+                    gradient=gradient,
+                    rowband_diagnostic=rowband_diagnostic,
+                    target_blocks=target_blocks,
+                    multipliers=last_direct_multipliers,
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                )
         else:
-            candidates, candidate_variables, candidate_evaluations = evaluate_step_candidates(
-                model=model,
-                variables=variables,
-                direction=direction,
-                search_scale=search_scale,
-                step_multipliers=step_multipliers,
-                base_objective=base_objective,
-                base_components=base_components,
-                iteration=iteration,
-                step_search_mode=step_search_mode,
+            raw_direction, preconditioner = raw_direction_for_mode(mode, variables, gradient, rowband_diagnostic)
+            tangent_direction = projected_tangent_direction_for_mode(
+                model,
+                variables,
+                gradient,
+                raw_direction,
+                preconditioner,
             )
+            direction, direction_norm_before_normalization = normalize_direction(tangent_direction)
+            directional_derivative = variable_dot(gradient, direction)
+            last_projection = gauge_projection_name(preconditioner)
+            if (
+                direction_norm_before_normalization == 0.0
+                or not np.isfinite(directional_derivative)
+                or directional_derivative >= 0.0
+            ):
+                stop_reason = "projected direction was not a descent direction"
+                break
+
+            search_scale = step_scale
+            step_multipliers, step_search_mode, scheduled_sweep = step_multipliers_for_iteration(
+                iteration=iteration,
+                step_sweep_initial_iterations=step_sweep_initial_iterations,
+                step_sweep_period=step_sweep_period,
+                step_sweep_mode=step_sweep_mode,
+                step_sweep_start_multiplier=step_sweep_start_multiplier,
+                last_step_multiplier=last_step_multiplier,
+            )
+            if step_search_mode == "neighbor_sweep":
+                candidates, candidate_variables, candidate_evaluations = evaluate_neighbor_step_candidates(
+                    model=model,
+                    variables=variables,
+                    direction=direction,
+                    search_scale=search_scale,
+                    initial_multipliers=step_multipliers,
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                )
+            else:
+                candidates, candidate_variables, candidate_evaluations = evaluate_step_candidates(
+                    model=model,
+                    variables=variables,
+                    direction=direction,
+                    search_scale=search_scale,
+                    step_multipliers=step_multipliers,
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                    step_search_mode=step_search_mode,
+                )
         iteration_trial_count = len(candidates)
         candidate_history.extend(candidates)
 
         accepted_index, accepted_variables = choose_best_candidate(candidates, candidate_variables)
         if accepted_index is None and not scheduled_sweep and recovery_step_sweep:
-            recovery_candidates, recovery_variables, recovery_evaluations = evaluate_step_candidates(
-                model=model,
-                variables=variables,
-                direction=direction,
-                search_scale=search_scale,
-                step_multipliers=effective_step_multipliers(),
-                base_objective=base_objective,
-                base_components=base_components,
-                iteration=iteration,
-                step_search_mode="recovery_sweep",
-            )
+            if mode == "rowband_all":
+                recovery_candidates, recovery_variables, recovery_evaluations = rowband_direct_coordinate_candidates(
+                    model=model,
+                    variables=variables,
+                    gradient=gradient,
+                    rowband_diagnostic=rowband_diagnostic,
+                    target_blocks=target_blocks,
+                    field_multipliers=effective_direct_field_multipliers(),
+                    scalar_multipliers=effective_direct_scalar_multipliers(),
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                    step_search_mode="direct_recovery_sweep",
+                )
+            else:
+                recovery_candidates, recovery_variables, recovery_evaluations = evaluate_step_candidates(
+                    model=model,
+                    variables=variables,
+                    direction=direction,
+                    search_scale=search_scale,
+                    step_multipliers=effective_step_multipliers(),
+                    base_objective=base_objective,
+                    base_components=base_components,
+                    iteration=iteration,
+                    step_search_mode="recovery_sweep",
+                )
             iteration_trial_count += len(recovery_candidates)
             candidate_history.extend(recovery_candidates)
             candidates = recovery_candidates
@@ -742,6 +1122,11 @@ def run_optimizer(
         # norm each iteration, while still reusing this multiplier.
         step_scale = float(best["step"])
         last_step_multiplier = float(best["step_multiplier"])
+        if mode == "rowband_all":
+            last_direct_multipliers = direct_candidate_multipliers(best)
+            direction_norm_before_normalization = float(best["step"])
+            directional_derivative = float(best["directional_derivative"])
+            last_projection = "preconditioned"
         residuals = residual_rms_summary(model, current_evaluation)
         gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
         components = best["objective_components"]
@@ -760,6 +1145,10 @@ def run_optimizer(
         row["search_step_scale"] = float(search_scale)
         row["step_search_mode"] = str(best["step_search_mode"])
         row["accepted_step_multiplier"] = float(best["step_multiplier"])
+        if mode == "rowband_all":
+            row["field_step_multiplier"] = float(best["field_step_multiplier"])
+            for key in SCALAR_BLOCKS:
+                row[f"{key}_direct_multiplier"] = float(best[f"{key}_direct_multiplier"])
         row["line_search_trial_count"] = int(iteration_trial_count)
         row.update(component_history_fields(components))
         history.append(row)
@@ -816,6 +1205,10 @@ def run_optimizer(
         "gauge_projection": last_projection,
         "initial_step_scale": initial_step_scale,
         "line_search_step_multipliers": effective_step_multipliers(),
+        "rowband_scalar_update": "direct_gradient_coordinate_sweep" if mode == "rowband_all" else "global_line_search",
+        "direct_field_multipliers": effective_direct_field_multipliers() if mode == "rowband_all" else [],
+        "direct_scalar_multipliers": effective_direct_scalar_multipliers() if mode == "rowband_all" else [],
+        "last_direct_multipliers": last_direct_multipliers if last_direct_multipliers is not None else {},
         "step_sweep_initial_iterations": step_sweep_initial_iterations,
         "step_sweep_period": step_sweep_period,
         "step_sweep_mode": step_sweep_mode,
@@ -824,11 +1217,7 @@ def run_optimizer(
         "max_iterations": max_iterations,
         "min_objective_decrease": MIN_OBJECTIVE_DECREASE,
         "gauge_tolerance": GAUGE_TOLERANCE,
-        "target_blocks": (
-            target_blocks_from_diagnostic(rowband_diagnostic)
-            if rowband_diagnostic is not None and mode in ("rowband_all", "raw_all")
-            else ()
-        ),
+        "target_blocks": target_blocks,
         "ranks": {core.name: int(core.rank) for core in model.cores},
         "history": history,
         "candidate_history": candidate_history,

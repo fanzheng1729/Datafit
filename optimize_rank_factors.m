@@ -50,6 +50,7 @@ initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 initial_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 step_scale = opts.initialStepScale;
 last_step_multiplier = opts.initialStepMultiplier;
+last_direct_multipliers = [];
 history = struct([]);
 candidate_history = struct([]);
 stop_reason = "reached maximum iterations";
@@ -65,56 +66,72 @@ for iteration = 1:opts.maxIterations
     base_objective = objective_from_residuals(model, current_evaluation.residuals);
     base_components = objective_components(model, current_evaluation.residuals);
     gradient = analytic_gradient(model, variables, current_evaluation);
-    [raw_direction, preconditioner] = raw_direction_for_mode( ...
-        opts.mode, variables, gradient, rowband_diagnostic, target_blocks, model);
-
-    % Project the raw negative gradient into the tangent space of the origin
-    % gauges before trying any step. This keeps c_l and c_omega tied to the
-    % normalization conditions used by the dynamic-rescaling equations.
-    tangent_direction = projected_tangent_direction( ...
-        model, variables, gradient, raw_direction, preconditioner);
-    [direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
     gradient_norm = variable_norm(gradient, model.variableKeys);
-    directional_derivative = variable_dot(gradient, direction, model.variableKeys);
     last_gradient_norm = gradient_norm;
-    last_projected_gradient_norm = projected_gradient_norm;
-    last_directional_derivative = directional_derivative;
 
-    if ~isfinite(directional_derivative) || directional_derivative >= 0
-        stop_reason = "projected direction was not a descent direction";
-        break
-    end
-
-    search_step_scale = step_scale;
-    if is_rowband_mode(opts.mode)
-        % Row-band directions already carry the measured safe group magnitudes.
-        % The line search therefore starts from that natural norm, as in the
-        % pushed Python comparison, instead of the tiny vanilla gradient scale.
-        search_step_scale = projected_gradient_norm;
-    end
-
-    [step_multipliers, step_search_mode, scheduled_sweep] = step_multipliers_for_iteration( ...
-        opts, iteration, last_step_multiplier);
-    if step_search_mode == "neighbor_sweep"
-        [candidates, candidate_variables, candidate_evaluations] = evaluate_neighbor_step_candidates( ...
-            model, variables, direction, search_step_scale, step_multipliers, ...
-            base_objective, base_components, opts, iteration);
+    if opts.mode == "rowband_all"
+        scheduled_sweep = should_sweep_steps(opts, iteration);
+        search_step_scale = 1.0;
+        if scheduled_sweep || isempty(last_direct_multipliers)
+            [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
+                model, variables, gradient, rowband_diagnostic, target_blocks, ...
+                effective_direct_field_multipliers(), effective_direct_scalar_multipliers(), ...
+                base_objective, base_components, opts, iteration, "direct_sweep");
+        else
+            [candidates, candidate_variables, candidate_evaluations] = rowband_direct_single_candidate( ...
+                model, variables, gradient, rowband_diagnostic, target_blocks, ...
+                last_direct_multipliers, base_objective, base_components, opts, iteration);
+        end
     else
-        [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
-            model, variables, direction, search_step_scale, step_multipliers, ...
-            base_objective, base_components, opts, iteration, step_search_mode);
+        [raw_direction, preconditioner] = raw_direction_for_mode( ...
+            opts.mode, variables, gradient, rowband_diagnostic, target_blocks, model);
+
+        % Project the raw negative gradient into the tangent space of the origin
+        % gauges before trying any step. This keeps c_l and c_omega tied to the
+        % normalization conditions used by the dynamic-rescaling equations.
+        tangent_direction = projected_tangent_direction( ...
+            model, variables, gradient, raw_direction, preconditioner);
+        [direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
+        directional_derivative = variable_dot(gradient, direction, model.variableKeys);
+        last_projected_gradient_norm = projected_gradient_norm;
+        last_directional_derivative = directional_derivative;
+
+        if ~isfinite(directional_derivative) || directional_derivative >= 0
+            stop_reason = "projected direction was not a descent direction";
+            break
+        end
+
+        search_step_scale = step_scale;
+        [step_multipliers, step_search_mode, scheduled_sweep] = step_multipliers_for_iteration( ...
+            opts, iteration, last_step_multiplier);
+        if step_search_mode == "neighbor_sweep"
+            [candidates, candidate_variables, candidate_evaluations] = evaluate_neighbor_step_candidates( ...
+                model, variables, direction, search_step_scale, step_multipliers, ...
+                base_objective, base_components, opts, iteration);
+        else
+            [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
+                model, variables, direction, search_step_scale, step_multipliers, ...
+                base_objective, base_components, opts, iteration, step_search_mode);
+        end
     end
     iteration_trial_count = numel(candidates);
     candidate_history = append_struct_array(candidate_history, candidates);
 
-    accepted = find([candidates.accepted]);
+    accepted = accepted_candidate_indices(candidates);
     if isempty(accepted) && ~scheduled_sweep && opts.recoveryStepSweep
-        [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
-            model, variables, direction, search_step_scale, effective_step_multipliers(opts), ...
-            base_objective, base_components, opts, iteration, "recovery_sweep");
+        if opts.mode == "rowband_all"
+            [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
+                model, variables, gradient, rowband_diagnostic, target_blocks, ...
+                effective_direct_field_multipliers(), effective_direct_scalar_multipliers(), ...
+                base_objective, base_components, opts, iteration, "direct_recovery_sweep");
+        else
+            [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
+                model, variables, direction, search_step_scale, effective_step_multipliers(opts), ...
+                base_objective, base_components, opts, iteration, "recovery_sweep");
+        end
         iteration_trial_count = iteration_trial_count + numel(candidates);
         candidate_history = append_struct_array(candidate_history, candidates);
-        accepted = find([candidates.accepted]);
+        accepted = accepted_candidate_indices(candidates);
     end
     if isempty(accepted)
         stop_reason = "no line-search candidate reduced the objective while preserving gauges";
@@ -128,6 +145,13 @@ for iteration = 1:opts.maxIterations
     current_evaluation = candidate_evaluations{accepted_index};
     step_scale = best.step;
     last_step_multiplier = best.step_multiplier;
+    if opts.mode == "rowband_all"
+        last_direct_multipliers = direct_candidate_multipliers(best);
+        projected_gradient_norm = best.step;
+        directional_derivative = best.directional_derivative;
+        last_projected_gradient_norm = projected_gradient_norm;
+        last_directional_derivative = directional_derivative;
+    end
     residuals = residual_rms_from_residuals(current_evaluation.residuals);
     gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
     components = best.objective_components;
@@ -137,6 +161,12 @@ for iteration = 1:opts.maxIterations
         gradient_norm, projected_gradient_norm, directional_derivative, ...
         gauge_errors, residuals, opts.mode, search_step_scale, components, ...
         best.step_search_mode, best.step_multiplier, iteration_trial_count, variables);
+    if opts.mode == "rowband_all"
+        row.field_step_multiplier = best.field_step_multiplier;
+        row.cl_direct_multiplier = best.cl_direct_multiplier;
+        row.cw_direct_multiplier = best.cw_direct_multiplier;
+        row.rat_direct_multiplier = best.rat_direct_multiplier;
+    end
     history = append_struct(history, row);
 
     fprintf("  iter %02d/%d: J=%.12e dJ=%.3e step=%.3e mult=%.3g search=%s trials=%d |d_raw|=%.3e div_loss=%.3e curl_loss=%.3e gauge=%.3e\n", ...
@@ -200,6 +230,17 @@ output.last_gradient_norm = last_gradient_norm;
 output.last_projected_gradient_norm = last_projected_gradient_norm;
 output.last_directional_derivative = last_directional_derivative;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
+if opts.mode == "rowband_all"
+    output.rowband_scalar_update = "direct_gradient_coordinate_sweep";
+    output.direct_field_multipliers = effective_direct_field_multipliers();
+    output.direct_scalar_multipliers = effective_direct_scalar_multipliers();
+    output.last_direct_multipliers = last_direct_multipliers;
+else
+    output.rowband_scalar_update = "global_line_search";
+    output.direct_field_multipliers = [];
+    output.direct_scalar_multipliers = [];
+    output.last_direct_multipliers = [];
+end
 output.initial_step_scale = opts.initialStepScale;
 output.initial_step_multiplier = opts.initialStepMultiplier;
 output.trusted_step_scale = step_scale;
@@ -374,6 +415,22 @@ function multipliers = effective_step_multipliers(opts)
 % The pushed row-band result uses the original seven-point bracket.
 
 multipliers = opts.stepMultipliers;
+end
+
+function multipliers = effective_direct_field_multipliers()
+% Field multipliers used by the direct-scalar row-band tuple search.
+
+multipliers = [10.0, 3.0, 1.0, 0.3, 0.1, 0.03, 0.01, ...
+    0.003, 0.001, 0.0003, 0.0001, 0.00003, 0.00001];
+end
+
+function multipliers = effective_direct_scalar_multipliers()
+% Absolute preconditioner scales for d_scalar = -m_scalar * g_scalar.
+
+multipliers = [0.0, 1.0e-15, 3.0e-15, 1.0e-14, 3.0e-14, ...
+    1.0e-13, 3.0e-13, 1.0e-12, 3.0e-12, 1.0e-11, 3.0e-11, ...
+    1.0e-10, 3.0e-10, 1.0e-9, 3.0e-9, 1.0e-8, 3.0e-8, ...
+    1.0e-7, 3.0e-7, 1.0e-6, 3.0e-6, 1.0e-5];
 end
 
 function steps = line_search_steps(stepScale, multipliers)
@@ -661,6 +718,61 @@ if isempty(steps)
 else
     safeStep = min(steps);
 end
+end
+
+function preconditioner = rowband_direct_base_preconditioner(gradient, diagnostic, targetBlocks, keys)
+% Row-band field metric with cl/cw/rat initially disabled.
+
+preconditioner = rowband_preconditioner(gradient, diagnostic, targetBlocks, keys);
+for name = ["cl", "cw", "rat"]
+    key = char(name);
+    if isfield(preconditioner, key)
+        preconditioner.(key) = 0.0;
+    end
+end
+end
+
+function preconditioner = rowband_direct_preconditioner(basePreconditioner, multipliers, keys)
+% Apply one field multiplier and direct scalar-gradient scales.
+
+preconditioner = copy_variables(basePreconditioner);
+for keyName = keys
+    key = char(keyName);
+    if ~isscalar(preconditioner.(key))
+        preconditioner.(key) = multipliers.field * preconditioner.(key);
+    end
+end
+preconditioner.cl = multipliers.cl;
+preconditioner.cw = multipliers.cw;
+preconditioner.rat = multipliers.rat;
+end
+
+function multipliers = direct_multiplier_tuple(fieldMultiplier, scalars)
+% Normalize row-band direct multiplier tuples.
+
+if nargin < 2 || isempty(scalars)
+    scalars = struct();
+end
+multipliers = struct();
+multipliers.field = double(fieldMultiplier);
+multipliers.cl = scalar_field_or_zero(scalars, "cl");
+multipliers.cw = scalar_field_or_zero(scalars, "cw");
+multipliers.rat = scalar_field_or_zero(scalars, "rat");
+end
+
+function value = scalar_field_or_zero(values, name)
+key = char(name);
+if isfield(values, key)
+    value = double(values.(key));
+else
+    value = 0.0;
+end
+end
+
+function multipliers = direct_candidate_multipliers(candidate)
+% Extract the direct multiplier tuple stored in a candidate summary.
+
+multipliers = candidate.rowband_direct_multipliers;
 end
 
 function safeStep = group_safe_step(group)
@@ -1310,6 +1422,134 @@ gram = factors' * factors;
 value = norm(gram - eye(size(gram)), "fro");
 end
 
+function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
+    model, variables, gradient, diagnostic, targetBlocks, fieldMultipliers, scalarMultipliers, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+% No-duplicate direct search: field-only seed, then cl/cw/rat in turn.
+
+basePreconditioner = rowband_direct_base_preconditioner( ...
+    gradient, diagnostic, targetBlocks, model.variableKeys);
+candidates = struct([]);
+candidate_variables = cell(0, 1);
+candidate_evaluations = cell(0, 1);
+
+seedTuples = struct([]);
+for k = 1:numel(fieldMultipliers)
+    seedTuples = append_struct(seedTuples, direct_multiplier_tuple(fieldMultipliers(k)));
+end
+[newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
+    model, variables, gradient, basePreconditioner, seedTuples, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode);
+candidates = append_struct_array(candidates, newCandidates);
+candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
+candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
+
+accepted = accepted_candidate_indices(candidates);
+if isempty(accepted)
+    return
+end
+[~, localIndex] = min([candidates(accepted).objective]);
+currentMultipliers = direct_candidate_multipliers(candidates(accepted(localIndex)));
+
+for scalarName = ["cl", "cw", "rat"]
+    trialTuples = struct([]);
+    for k = 1:numel(scalarMultipliers)
+        trial = currentMultipliers;
+        trial.(char(scalarName)) = scalarMultipliers(k);
+        trialTuples = append_struct(trialTuples, trial);
+    end
+    [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
+        model, variables, gradient, basePreconditioner, trialTuples, ...
+        baseObjective, baseComponents, opts, iteration, stepSearchMode + "_" + scalarName);
+    candidates = append_struct_array(candidates, newCandidates);
+    candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
+    candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
+    accepted = accepted_candidate_indices(candidates);
+    if ~isempty(accepted)
+        [~, localIndex] = min([candidates(accepted).objective]);
+        currentMultipliers = direct_candidate_multipliers(candidates(accepted(localIndex)));
+    end
+end
+end
+
+function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_single_candidate( ...
+    model, variables, gradient, diagnostic, targetBlocks, multipliers, ...
+    baseObjective, baseComponents, opts, iteration)
+% Evaluate the trusted direct multiplier tuple once.
+
+basePreconditioner = rowband_direct_base_preconditioner( ...
+    gradient, diagnostic, targetBlocks, model.variableKeys);
+[candidates, candidate_variables, candidate_evaluations] = evaluate_direct_tuple_candidates( ...
+    model, variables, gradient, basePreconditioner, multipliers, ...
+    baseObjective, baseComponents, opts, iteration, "direct_single");
+end
+
+function [candidates, candidate_variables, candidate_evaluations] = evaluate_direct_tuple_candidates( ...
+    model, variables, gradient, basePreconditioner, multiplierTuples, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+% Evaluate row-band direct tuples, skipping non-descent degeneracies.
+
+candidates = struct([]);
+candidate_variables = cell(0, 1);
+candidate_evaluations = cell(0, 1);
+for k = 1:numel(multiplierTuples)
+    [summary, candidate, candidate_evaluation, ok] = direct_candidate( ...
+        model, variables, gradient, basePreconditioner, multiplierTuples(k), ...
+        baseObjective, baseComponents, opts, iteration, stepSearchMode);
+    if ~ok
+        continue
+    end
+    candidates = append_struct(candidates, summary);
+    candidate_variables{end + 1, 1} = candidate; %#ok<AGROW>
+    candidate_evaluations{end + 1, 1} = candidate_evaluation; %#ok<AGROW>
+end
+end
+
+function [summary, candidate, candidate_evaluation, ok] = direct_candidate( ...
+    model, variables, gradient, basePreconditioner, multipliers, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+% Build one direct-scalar preconditioned candidate.
+
+preconditioner = rowband_direct_preconditioner(basePreconditioner, multipliers, model.variableKeys);
+tangent_direction = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner);
+[direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
+summary = struct();
+candidate = struct();
+candidate_evaluation = struct();
+ok = false;
+if projected_gradient_norm == 0
+    return
+end
+directional_derivative = variable_dot(gradient, direction, model.variableKeys);
+if ~isfinite(directional_derivative) || directional_derivative >= 0
+    return
+end
+
+[summary, candidate, candidate_evaluation] = candidate_summary( ...
+    model, variables, direction, projected_gradient_norm, baseObjective, baseComponents, opts);
+summary.iteration = iteration;
+summary.step_multiplier = multipliers.field;
+summary.step_multiplier_index = nearest_step_multiplier_index(effective_direct_field_multipliers(), multipliers.field);
+summary.step_search_mode = stepSearchMode;
+summary.rowband_direct_multipliers = multipliers;
+summary.field_step_multiplier = multipliers.field;
+summary.cl_direct_multiplier = multipliers.cl;
+summary.cw_direct_multiplier = multipliers.cw;
+summary.rat_direct_multiplier = multipliers.rat;
+summary.directional_derivative = directional_derivative;
+ok = true;
+end
+
+function indices = accepted_candidate_indices(candidates)
+% Accepted candidate indices, robust to an empty struct array.
+
+if isempty(candidates)
+    indices = [];
+else
+    indices = find([candidates.accepted]);
+end
+end
+
 function [candidates, candidate_variables, candidate_evaluations] = evaluate_neighbor_step_candidates( ...
     model, variables, direction, searchStepScale, initialMultipliers, ...
     baseObjective, baseComponents, opts, iteration)
@@ -1611,6 +1851,15 @@ output.gauge_errors_before = initial_gauge_errors;
 output.gauge_errors_after = current_gauge_errors;
 output.gauge_projection = gauge_projection_for_mode(opts.mode);
 output.line_search_step_multipliers = effective_step_multipliers(opts);
+if opts.mode == "rowband_all"
+    output.rowband_scalar_update = "direct_gradient_coordinate_sweep";
+    output.direct_field_multipliers = effective_direct_field_multipliers();
+    output.direct_scalar_multipliers = effective_direct_scalar_multipliers();
+else
+    output.rowband_scalar_update = "global_line_search";
+    output.direct_field_multipliers = [];
+    output.direct_scalar_multipliers = [];
+end
 output.initial_step_scale = opts.initialStepScale;
 output.initial_step_multiplier = opts.initialStepMultiplier;
 output.trusted_step_scale = stepScale;

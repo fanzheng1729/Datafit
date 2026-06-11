@@ -5,8 +5,9 @@ function output = optimize_rank_factors_pq_rowband(varargin)
 % reuses the existing model, gradient, retraction, line search, state saving,
 % and JSON/CSV writers. Defaults mirror the current rat-enabled all-variable
 % comparison: start from data.mat, use the all-variable diagnostic, run
-% rowband_all at constraintWeight = 0.007, and use the cheap neighbor step
-% policy that sweeps the first five iterations and then every five.
+% rowband_all at constraintWeight = 0.007. The row-band path now uses the
+% direct scalar-gradient coordinate sweep for cl, cw, and rat while keeping
+% the field blocks on measured row-band scaling.
 %
 % Examples:
 %   optimize_rank_factors_pq_rowband()
