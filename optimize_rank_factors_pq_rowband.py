@@ -1105,7 +1105,16 @@ def evaluate_neighbor_step_candidates(
         ]
         accepted = [candidate for candidate in current_candidates if candidate["accepted"]]
         if not accepted:
-            break
+            expanded_indices = list(
+                range(
+                    max(0, current_indices[0] - 1),
+                    min(len(ladder) - 1, current_indices[-1] + 1) + 1,
+                )
+            )
+            if expanded_indices == current_indices:
+                break
+            current_indices = expanded_indices
+            continue
 
         best = min(accepted, key=lambda candidate: float(candidate["objective"]))
         best_index = int(best["step_multiplier_index"])

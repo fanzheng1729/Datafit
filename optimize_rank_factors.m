@@ -1774,7 +1774,12 @@ while true
     currentCandidates = candidates(currentMask);
     accepted = find([currentCandidates.accepted]);
     if isempty(accepted)
-        break
+        expandedIndices = max(1, currentIndices(1) - 1):min(numel(ladder), currentIndices(end) + 1);
+        if isequal(expandedIndices, currentIndices)
+            break
+        end
+        currentIndices = expandedIndices;
+        continue
     end
 
     [~, localIndex] = min([currentCandidates(accepted).objective]);
