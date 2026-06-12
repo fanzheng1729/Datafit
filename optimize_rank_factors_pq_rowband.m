@@ -5,9 +5,11 @@ function output = optimize_rank_factors_pq_rowband(varargin)
 % reuses the existing model, gradient, retraction, line search, state saving,
 % and JSON/CSV writers. Defaults mirror the current rat-enabled all-variable
 % comparison: start from data.mat, use the all-variable diagnostic, run
-% rowband_all at constraintWeight = 0.007. The row-band path now uses the
-% direct scalar-gradient coordinate sweep for cl, cw, and rat, with two warmup
-% sweeps and a 20-step scheduled sweep period.
+% rowband_all at constraintWeight = 0.007. By default the row-band path uses
+% the direct scalar-gradient coordinate sweep for cl, cw, and rat, with two
+% warmup sweeps and a 20-step scheduled neighbor-sweep period. Pass
+% 'RowbandScalarUpdate','global_line_search' to use the previous shared global
+% multiplier sweep instead.
 %
 % Examples:
 %   optimize_rank_factors_pq_rowband()
@@ -21,6 +23,7 @@ defaults = {
     "MaxIterations", 30, ...
     "OutputPrefix", "matlab_from_begin_rat_w0p007_updated_diag_30", ...
     "ConstraintWeight", 0.007, ...
+    "RowbandScalarUpdate", "direct_gradient_coordinate_sweep", ...
     "StepSweepInitialIterations", 2, ...
     "StepSweepPeriod", 20, ...
     "StepSweepMode", "neighbor"};

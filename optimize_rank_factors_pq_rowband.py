@@ -3,7 +3,8 @@
 
 This experiment starts from an existing optimizer state and runs the
 all-variable row-band path, plus full-variable raw/vanilla controls.  The
-row-band path uses direct scalar-gradient multiplier sweeps for cl/cw/rat and
+row-band path can either use the previous global line-search multiplier for
+all variables or direct scalar-gradient multiplier sweeps for cl/cw/rat with
 measured row-band scaling for field blocks.
 
 The objective itself is unchanged.  Every trial point is retracted/refit before
@@ -518,6 +519,13 @@ def local_step_multiplier_window(
     return [ladder[index] for index in neighbor_window_indices(center_index, len(ladder))]
 
 
+def local_direct_multiplier_window(ladder: list[float], value: float) -> list[float]:
+    """Return a local direct-multiplier window, accepting zero as an endpoint."""
+
+    center_index = nearest_direct_multiplier_index(ladder, value)
+    return [ladder[index] for index in neighbor_window_indices(center_index, len(ladder))]
+
+
 def step_multipliers_for_iteration(
     *,
     iteration: int,
@@ -548,6 +556,59 @@ def step_multipliers_for_iteration(
     if last_step_multiplier is not None:
         return [last_step_multiplier], "single", False
     return [1.0], "single_default", False
+
+
+def canonical_rowband_scalar_update(value: str) -> str:
+    """Normalize aliases for row-band scalar update policies."""
+
+    normalized = value.lower().replace("-", "_")
+    if normalized in {"global", "global_line_search", "line_search", "shared"}:
+        return "global_line_search"
+    if normalized in {"direct", "direct_gradient_coordinate_sweep", "coordinate", "separate"}:
+        return "direct_gradient_coordinate_sweep"
+    raise ValueError(
+        "rowband_scalar_update must be 'global_line_search' or "
+        "'direct_gradient_coordinate_sweep'"
+    )
+
+
+def use_direct_rowband_scalar_update(mode: str, rowband_scalar_update: str) -> bool:
+    """Return whether rowband_all should sweep field/scalar multipliers separately."""
+
+    return mode == "rowband_all" and rowband_scalar_update == "direct_gradient_coordinate_sweep"
+
+
+def use_direct_neighbor_sweep(
+    *,
+    step_sweep_mode: str,
+    last_direct_multipliers: dict[str, float] | None,
+    iteration: int,
+    step_sweep_initial_iterations: int,
+) -> bool:
+    """Return whether direct mode should seed from the last accepted tuple."""
+
+    return (
+        step_sweep_mode == "neighbor"
+        and last_direct_multipliers is not None
+        and iteration > step_sweep_initial_iterations
+    )
+
+
+def direct_sweep_multipliers(
+    *,
+    step_sweep_mode: str,
+    last_direct_multipliers: dict[str, float] | None,
+    iteration: int,
+    step_sweep_initial_iterations: int,
+    base_search_mode: str,
+) -> tuple[list[float], dict[str, list[float]] | list[float], str]:
+    """Return full direct ladders for warmup, explicit full mode, and recovery."""
+
+    return (
+        effective_direct_field_multipliers(),
+        effective_direct_scalar_multipliers(),
+        base_search_mode,
+    )
 
 
 def candidate_with_components(
@@ -690,7 +751,7 @@ def rowband_direct_coordinate_candidates(
     rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
     field_multipliers: list[float],
-    scalar_multipliers: list[float],
+    scalar_multipliers: dict[str, list[float]] | list[float],
     base_objective: float,
     base_components: dict[str, float],
     iteration: int,
@@ -732,8 +793,13 @@ def rowband_direct_coordinate_candidates(
 
     current_multipliers = direct_candidate_multipliers(candidates[accepted_index])
     for scalar_key in SCALAR_BLOCKS:
+        scalar_choices = (
+            scalar_multipliers[scalar_key]
+            if isinstance(scalar_multipliers, dict)
+            else scalar_multipliers
+        )
         trial_tuples = []
-        for scalar_multiplier in scalar_multipliers:
+        for scalar_multiplier in scalar_choices:
             trial = dict(current_multipliers)
             trial[scalar_key] = float(scalar_multiplier)
             trial_tuples.append(trial)
@@ -754,6 +820,145 @@ def rowband_direct_coordinate_candidates(
         accepted_index, _ = choose_best_candidate(candidates, candidate_variables)
         if accepted_index is not None:
             current_multipliers = direct_candidate_multipliers(candidates[accepted_index])
+
+    return candidates, candidate_variables, candidate_evaluations
+
+
+def rowband_direct_neighbor_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    rowband_diagnostic: dict[str, Any],
+    target_blocks: tuple[str, ...],
+    last_multipliers: dict[str, float],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+    step_search_mode: str,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Seed from the last accepted direct tuple, then widen each coordinate."""
+
+    base_preconditioner = rowband_direct_base_preconditioner(
+        variables,
+        gradient,
+        rowband_diagnostic,
+        target_blocks,
+    )
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+    current_multipliers = direct_multiplier_tuple(
+        float(last_multipliers["field"]),
+        {key: float(last_multipliers[key]) for key in SCALAR_BLOCKS},
+    )
+
+    for coordinate in ("field", *SCALAR_BLOCKS):
+        ladder = (
+            effective_direct_field_multipliers()
+            if coordinate == "field"
+            else effective_direct_scalar_multipliers()
+        )
+        new_candidates, new_variables, new_evaluations = evaluate_direct_coordinate_neighbor_candidates(
+            model=model,
+            variables=variables,
+            gradient=gradient,
+            base_preconditioner=base_preconditioner,
+            center_multipliers=current_multipliers,
+            coordinate=coordinate,
+            ladder=ladder,
+            base_objective=base_objective,
+            base_components=base_components,
+            iteration=iteration,
+            step_search_mode=f"{step_search_mode}_{coordinate}",
+        )
+        candidates.extend(new_candidates)
+        candidate_variables.extend(new_variables)
+        candidate_evaluations.extend(new_evaluations)
+        accepted_index, _ = choose_best_candidate(candidates, candidate_variables)
+        if accepted_index is not None:
+            current_multipliers = direct_candidate_multipliers(candidates[accepted_index])
+
+    return candidates, candidate_variables, candidate_evaluations
+
+
+def evaluate_direct_coordinate_neighbor_candidates(
+    *,
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    base_preconditioner: VariableDict,
+    center_multipliers: dict[str, float],
+    coordinate: str,
+    ladder: list[float],
+    base_objective: float,
+    base_components: dict[str, float],
+    iteration: int,
+    step_search_mode: str,
+) -> tuple[list[dict[str, Any]], list[VariableDict], list[Evaluation]]:
+    """Walk one direct multiplier ladder outward from a trusted coordinate."""
+
+    center_index = nearest_direct_multiplier_index(ladder, float(center_multipliers[coordinate]))
+    current_indices = neighbor_window_indices(center_index, len(ladder))
+    evaluated = [False] * len(ladder)
+    candidates: list[dict[str, Any]] = []
+    candidate_variables: list[VariableDict] = []
+    candidate_evaluations: list[Evaluation] = []
+
+    while True:
+        new_indices = [index for index in current_indices if not evaluated[index]]
+        for index in new_indices:
+            trial = dict(center_multipliers)
+            trial[coordinate] = float(ladder[index])
+            new_candidates, new_variables, new_evaluations = evaluate_direct_tuple_candidates(
+                model=model,
+                variables=variables,
+                gradient=gradient,
+                base_preconditioner=base_preconditioner,
+                multiplier_tuples=[trial],
+                base_objective=base_objective,
+                base_components=base_components,
+                iteration=iteration,
+                step_search_mode=step_search_mode,
+            )
+            for candidate in new_candidates:
+                candidate["direct_neighbor_coordinate"] = coordinate
+                candidate["direct_neighbor_index"] = index
+            candidates.extend(new_candidates)
+            candidate_variables.extend(new_variables)
+            candidate_evaluations.extend(new_evaluations)
+            evaluated[index] = True
+
+        current_set = set(current_indices)
+        current_candidates = [
+            candidate
+            for candidate in candidates
+            if int(candidate["direct_neighbor_index"]) in current_set
+        ]
+        accepted = [candidate for candidate in current_candidates if candidate["accepted"]]
+        if not accepted:
+            expanded_indices = list(
+                range(
+                    max(0, current_indices[0] - 1),
+                    min(len(ladder) - 1, current_indices[-1] + 1) + 1,
+                )
+            )
+            if expanded_indices == current_indices:
+                break
+            current_indices = expanded_indices
+            continue
+
+        best = min(accepted, key=lambda candidate: float(candidate["objective"]))
+        best_index = int(best["direct_neighbor_index"])
+        if best_index == current_indices[0] and best_index > 0:
+            current_indices = neighbor_window_indices(best_index, len(ladder))
+        elif best_index == current_indices[-1] and best_index < len(ladder) - 1:
+            current_indices = neighbor_window_indices(best_index, len(ladder))
+        else:
+            break
+
+        if all(evaluated[index] for index in current_indices):
+            break
 
     return candidates, candidate_variables, candidate_evaluations
 
@@ -931,6 +1136,7 @@ def run_optimizer(
     step_sweep_start_multiplier: float,
     recovery_step_sweep: bool,
     constraint_weight: float,
+    rowband_scalar_update: str,
 ) -> dict[str, Any]:
     """Run a saved-state optimizer comparison.
 
@@ -952,6 +1158,7 @@ def run_optimizer(
         raise ValueError("step_sweep_mode must be 'full' or 'neighbor'")
     if step_sweep_start_multiplier <= 0.0 or not np.isfinite(step_sweep_start_multiplier):
         raise ValueError("step_sweep_start_multiplier must be positive and finite")
+    rowband_scalar_update = canonical_rowband_scalar_update(rowband_scalar_update)
 
     model = RankOptimizationModel(DATA_PATH, constraint_weight=constraint_weight)
     variables = model.complete_variables(load_state(state_path))
@@ -974,6 +1181,7 @@ def run_optimizer(
         else ()
     )
     last_direct_multipliers: dict[str, float] | None = None
+    direct_rowband_update = use_direct_rowband_scalar_update(mode, rowband_scalar_update)
 
     history: list[dict[str, float | int | str]] = []
     candidate_history: list[dict[str, Any]] = []
@@ -986,7 +1194,7 @@ def run_optimizer(
         base_components = objective_components(model, current_evaluation.residuals)
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
         gradient_norm = variable_norm(gradient)
-        if mode == "rowband_all":
+        if direct_rowband_update:
             if rowband_diagnostic is None:
                 raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
             scheduled_sweep = should_sweep_steps(
@@ -996,19 +1204,45 @@ def run_optimizer(
             )
             search_scale = 1.0
             if scheduled_sweep or last_direct_multipliers is None:
-                candidates, candidate_variables, candidate_evaluations = rowband_direct_coordinate_candidates(
-                    model=model,
-                    variables=variables,
-                    gradient=gradient,
-                    rowband_diagnostic=rowband_diagnostic,
-                    target_blocks=target_blocks,
-                    field_multipliers=effective_direct_field_multipliers(),
-                    scalar_multipliers=effective_direct_scalar_multipliers(),
-                    base_objective=base_objective,
-                    base_components=base_components,
+                if use_direct_neighbor_sweep(
+                    step_sweep_mode=step_sweep_mode,
+                    last_direct_multipliers=last_direct_multipliers,
                     iteration=iteration,
-                    step_search_mode="direct_sweep",
-                )
+                    step_sweep_initial_iterations=step_sweep_initial_iterations,
+                ):
+                    candidates, candidate_variables, candidate_evaluations = rowband_direct_neighbor_candidates(
+                        model=model,
+                        variables=variables,
+                        gradient=gradient,
+                        rowband_diagnostic=rowband_diagnostic,
+                        target_blocks=target_blocks,
+                        last_multipliers=last_direct_multipliers,
+                        base_objective=base_objective,
+                        base_components=base_components,
+                        iteration=iteration,
+                        step_search_mode="direct_sweep_neighbor",
+                    )
+                else:
+                    field_multipliers, scalar_multipliers, direct_search_mode = direct_sweep_multipliers(
+                        step_sweep_mode=step_sweep_mode,
+                        last_direct_multipliers=last_direct_multipliers,
+                        iteration=iteration,
+                        step_sweep_initial_iterations=step_sweep_initial_iterations,
+                        base_search_mode="direct_sweep",
+                    )
+                    candidates, candidate_variables, candidate_evaluations = rowband_direct_coordinate_candidates(
+                        model=model,
+                        variables=variables,
+                        gradient=gradient,
+                        rowband_diagnostic=rowband_diagnostic,
+                        target_blocks=target_blocks,
+                        field_multipliers=field_multipliers,
+                        scalar_multipliers=scalar_multipliers,
+                        base_objective=base_objective,
+                        base_components=base_components,
+                        iteration=iteration,
+                        step_search_mode=direct_search_mode,
+                    )
             else:
                 candidates, candidate_variables, candidate_evaluations = rowband_direct_single_candidate(
                     model=model,
@@ -1041,7 +1275,7 @@ def run_optimizer(
                 stop_reason = "projected direction was not a descent direction"
                 break
 
-            search_scale = step_scale
+            search_scale = direction_norm_before_normalization if mode == "rowband_all" else step_scale
             step_multipliers, step_search_mode, scheduled_sweep = step_multipliers_for_iteration(
                 iteration=iteration,
                 step_sweep_initial_iterations=step_sweep_initial_iterations,
@@ -1078,7 +1312,7 @@ def run_optimizer(
 
         accepted_index, accepted_variables = choose_best_candidate(candidates, candidate_variables)
         if accepted_index is None and not scheduled_sweep and recovery_step_sweep:
-            if mode == "rowband_all":
+            if direct_rowband_update:
                 recovery_candidates, recovery_variables, recovery_evaluations = rowband_direct_coordinate_candidates(
                     model=model,
                     variables=variables,
@@ -1122,7 +1356,7 @@ def run_optimizer(
         # norm each iteration, while still reusing this multiplier.
         step_scale = float(best["step"])
         last_step_multiplier = float(best["step_multiplier"])
-        if mode == "rowband_all":
+        if direct_rowband_update:
             last_direct_multipliers = direct_candidate_multipliers(best)
             direction_norm_before_normalization = float(best["step"])
             directional_derivative = float(best["directional_derivative"])
@@ -1145,7 +1379,7 @@ def run_optimizer(
         row["search_step_scale"] = float(search_scale)
         row["step_search_mode"] = str(best["step_search_mode"])
         row["accepted_step_multiplier"] = float(best["step_multiplier"])
-        if mode == "rowband_all":
+        if direct_rowband_update:
             row["field_step_multiplier"] = float(best["field_step_multiplier"])
             for key in SCALAR_BLOCKS:
                 row[f"{key}_direct_multiplier"] = float(best[f"{key}_direct_multiplier"])
@@ -1205,9 +1439,9 @@ def run_optimizer(
         "gauge_projection": last_projection,
         "initial_step_scale": initial_step_scale,
         "line_search_step_multipliers": effective_step_multipliers(),
-        "rowband_scalar_update": "direct_gradient_coordinate_sweep" if mode == "rowband_all" else "global_line_search",
-        "direct_field_multipliers": effective_direct_field_multipliers() if mode == "rowband_all" else [],
-        "direct_scalar_multipliers": effective_direct_scalar_multipliers() if mode == "rowband_all" else [],
+        "rowband_scalar_update": rowband_scalar_update if mode == "rowband_all" else "global_line_search",
+        "direct_field_multipliers": effective_direct_field_multipliers() if direct_rowband_update else [],
+        "direct_scalar_multipliers": effective_direct_scalar_multipliers() if direct_rowband_update else [],
         "last_direct_multipliers": last_direct_multipliers if last_direct_multipliers is not None else {},
         "step_sweep_initial_iterations": step_sweep_initial_iterations,
         "step_sweep_period": step_sweep_period,
@@ -1239,6 +1473,14 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     parser.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX)
     parser.add_argument("--initial-step-scale", type=float, default=INITIAL_STEP_SCALE)
     parser.add_argument("--constraint-weight", type=float, default=DEFAULT_CONSTRAINT_WEIGHT)
+    parser.add_argument(
+        "--rowband-scalar-update",
+        default="direct_gradient_coordinate_sweep",
+        help=(
+            "rowband_all scalar policy: global_line_search/direct_gradient_coordinate_sweep "
+            "(aliases: global, direct)"
+        ),
+    )
     parser.add_argument(
         "--step-sweep-initial-iterations",
         type=int,
@@ -1289,6 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
         step_sweep_start_multiplier=args.step_sweep_start_multiplier,
         recovery_step_sweep=not args.no_recovery_step_sweep,
         constraint_weight=args.constraint_weight,
+        rowband_scalar_update=args.rowband_scalar_update,
     )
     paths = output_paths(args.output_prefix)
     write_history_csv(paths["history"], output["history"])

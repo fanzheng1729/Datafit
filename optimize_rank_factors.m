@@ -15,6 +15,9 @@ fprintf("Monitored explicit-S rank-factor gradient optimization (MATLAB)\n");
 fprintf("  max iterations:           %d\n", opts.maxIterations);
 fprintf("  output prefix:            %s\n", opts.outputPrefix);
 fprintf("  mode:                     %s\n", opts.mode);
+if opts.mode == "rowband_all"
+    fprintf("  rowband scalar update:    %s\n", opts.rowbandScalarUpdate);
+end
 fprintf("  constraint weight:        %.12g\n", opts.constraintWeight);
 fprintf("  step sweep warmup:        %d\n", opts.stepSweepInitialIterations);
 fprintf("  step sweep period:        %d\n", opts.stepSweepPeriod);
@@ -69,14 +72,23 @@ for iteration = 1:opts.maxIterations
     gradient_norm = variable_norm(gradient, model.variableKeys);
     last_gradient_norm = gradient_norm;
 
-    if opts.mode == "rowband_all"
+    if use_direct_rowband_scalar_update(opts)
         scheduled_sweep = should_sweep_steps(opts, iteration);
         search_step_scale = 1.0;
         if scheduled_sweep || isempty(last_direct_multipliers)
-            [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
-                model, variables, gradient, rowband_diagnostic, target_blocks, ...
-                effective_direct_field_multipliers(), effective_direct_scalar_multipliers(), ...
-                base_objective, base_components, opts, iteration, "direct_sweep");
+            if use_direct_neighbor_sweep(opts, last_direct_multipliers, iteration)
+                [candidates, candidate_variables, candidate_evaluations] = rowband_direct_neighbor_candidates( ...
+                    model, variables, gradient, rowband_diagnostic, target_blocks, ...
+                    last_direct_multipliers, base_objective, base_components, opts, iteration, ...
+                    "direct_sweep_neighbor");
+            else
+                [field_multipliers, scalar_multipliers, direct_search_mode] = direct_sweep_multipliers( ...
+                    opts, last_direct_multipliers, iteration, "direct_sweep");
+                [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
+                    model, variables, gradient, rowband_diagnostic, target_blocks, ...
+                    field_multipliers, scalar_multipliers, ...
+                    base_objective, base_components, opts, iteration, direct_search_mode);
+            end
         else
             [candidates, candidate_variables, candidate_evaluations] = rowband_direct_single_candidate( ...
                 model, variables, gradient, rowband_diagnostic, target_blocks, ...
@@ -102,6 +114,10 @@ for iteration = 1:opts.maxIterations
         end
 
         search_step_scale = step_scale;
+        if is_rowband_mode(opts.mode)
+            % Row-band directions already carry measured safe group magnitudes.
+            search_step_scale = projected_gradient_norm;
+        end
         [step_multipliers, step_search_mode, scheduled_sweep] = step_multipliers_for_iteration( ...
             opts, iteration, last_step_multiplier);
         if step_search_mode == "neighbor_sweep"
@@ -119,7 +135,7 @@ for iteration = 1:opts.maxIterations
 
     accepted = accepted_candidate_indices(candidates);
     if isempty(accepted) && ~scheduled_sweep && opts.recoveryStepSweep
-        if opts.mode == "rowband_all"
+        if use_direct_rowband_scalar_update(opts)
             [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
                 model, variables, gradient, rowband_diagnostic, target_blocks, ...
                 effective_direct_field_multipliers(), effective_direct_scalar_multipliers(), ...
@@ -145,7 +161,7 @@ for iteration = 1:opts.maxIterations
     current_evaluation = candidate_evaluations{accepted_index};
     step_scale = best.step;
     last_step_multiplier = best.step_multiplier;
-    if opts.mode == "rowband_all"
+    if use_direct_rowband_scalar_update(opts)
         last_direct_multipliers = direct_candidate_multipliers(best);
         projected_gradient_norm = best.step;
         directional_derivative = best.directional_derivative;
@@ -161,7 +177,7 @@ for iteration = 1:opts.maxIterations
         gradient_norm, projected_gradient_norm, directional_derivative, ...
         gauge_errors, residuals, opts.mode, search_step_scale, components, ...
         best.step_search_mode, best.step_multiplier, iteration_trial_count, variables);
-    if opts.mode == "rowband_all"
+    if use_direct_rowband_scalar_update(opts)
         row.field_step_multiplier = best.field_step_multiplier;
         row.cl_direct_multiplier = best.cl_direct_multiplier;
         row.cw_direct_multiplier = best.cw_direct_multiplier;
@@ -231,12 +247,15 @@ output.last_projected_gradient_norm = last_projected_gradient_norm;
 output.last_directional_derivative = last_directional_derivative;
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 if opts.mode == "rowband_all"
-    output.rowband_scalar_update = "direct_gradient_coordinate_sweep";
+    output.rowband_scalar_update = opts.rowbandScalarUpdate;
+else
+    output.rowband_scalar_update = "global_line_search";
+end
+if use_direct_rowband_scalar_update(opts)
     output.direct_field_multipliers = effective_direct_field_multipliers();
     output.direct_scalar_multipliers = effective_direct_scalar_multipliers();
     output.last_direct_multipliers = last_direct_multipliers;
 else
-    output.rowband_scalar_update = "global_line_search";
     output.direct_field_multipliers = [];
     output.direct_scalar_multipliers = [];
     output.last_direct_multipliers = [];
@@ -299,6 +318,7 @@ opts.stepSweepStartMultiplier = 1.0;
 opts.initialStepMultiplier = NaN;
 opts.recoveryStepSweep = true;
 opts.checkpointPeriod = 0;
+opts.rowbandScalarUpdate = "direct_gradient_coordinate_sweep";
 
 if ~isempty(varargin) && isnumeric(varargin{1})
     opts.maxIterations = varargin{1};
@@ -347,6 +367,8 @@ for k = 1:2:numel(varargin)
             opts.recoveryStepSweep = logical_option(value);
         case {"checkpointperiod", "checkpointevery"}
             opts.checkpointPeriod = value;
+        case {"rowbandscalarupdate", "scalarupdate", "scalarupdatemode", "scalarsweepmode"}
+            opts.rowbandScalarUpdate = canonical_rowband_scalar_update(value);
         otherwise
             error("Unknown optimizer option: %s", varargin{k});
     end
@@ -370,6 +392,9 @@ if opts.stepSweepPeriod < 1 || opts.stepSweepPeriod ~= floor(opts.stepSweepPerio
 end
 if ~any(opts.stepSweepMode == ["full", "neighbor"])
     error("StepSweepMode must be 'full' or 'neighbor'.");
+end
+if ~any(opts.rowbandScalarUpdate == ["global_line_search", "direct_gradient_coordinate_sweep"])
+    error("RowbandScalarUpdate must be 'global_line_search' or 'direct_gradient_coordinate_sweep'.");
 end
 if opts.stepSweepStartMultiplier <= 0 || ~isfinite(opts.stepSweepStartMultiplier)
     error("StepSweepStartMultiplier must be positive and finite.");
@@ -411,6 +436,35 @@ else
 end
 end
 
+function value = canonical_rowband_scalar_update(raw)
+% Normalize aliases for the two row-band scalar update policies.
+
+value = lower(string(raw));
+switch value
+    case {"global", "global_line_search", "line_search", "shared"}
+        value = "global_line_search";
+    case {"direct", "direct_gradient_coordinate_sweep", "coordinate", "separate"}
+        value = "direct_gradient_coordinate_sweep";
+    otherwise
+        error("Unknown RowbandScalarUpdate: %s", raw);
+end
+end
+
+function yes = use_direct_rowband_scalar_update(opts)
+% True when rowband_all should sweep field/scalar multipliers separately.
+
+yes = opts.mode == "rowband_all" ...
+    && opts.rowbandScalarUpdate == "direct_gradient_coordinate_sweep";
+end
+
+function yes = use_direct_neighbor_sweep(opts, lastDirectMultipliers, iteration)
+% Direct neighbor sweeps need a trusted multiplier tuple to start from.
+
+yes = opts.stepSweepMode == "neighbor" ...
+    && ~isempty(lastDirectMultipliers) ...
+    && iteration > opts.stepSweepInitialIterations;
+end
+
 function multipliers = effective_step_multipliers(opts)
 % The pushed row-band result uses the original seven-point bracket.
 
@@ -431,6 +485,34 @@ multipliers = [0.0, 1.0e-15, 3.0e-15, 1.0e-14, 3.0e-14, ...
     1.0e-13, 3.0e-13, 1.0e-12, 3.0e-12, 1.0e-11, 3.0e-11, ...
     1.0e-10, 3.0e-10, 1.0e-9, 3.0e-9, 1.0e-8, 3.0e-8, ...
     1.0e-7, 3.0e-7, 1.0e-6, 3.0e-6, 1.0e-5];
+end
+
+function [fieldMultipliers, scalarMultipliers, searchMode] = direct_sweep_multipliers(~, ~, ~, baseSearchMode)
+% Full direct ladders used during warmup, explicit full mode, and recovery.
+
+fieldMultipliers = effective_direct_field_multipliers();
+scalarMultipliers = effective_direct_scalar_multipliers();
+searchMode = baseSearchMode;
+end
+
+function multipliers = local_direct_multiplier_window(ladder, value)
+% Return neighboring direct multipliers, with zero treated as a valid endpoint.
+
+centerIndex = nearest_direct_multiplier_index(ladder, value);
+indices = neighbor_window_indices(centerIndex, numel(ladder));
+multipliers = ladder(indices);
+end
+
+function index = nearest_direct_multiplier_index(ladder, value)
+% Direct scalar ladders include zero, so log-distance only applies when positive.
+
+if value <= 0
+    index = 1;
+    return
+end
+positive = find(ladder > 0);
+[~, localIndex] = min(abs(log(ladder(positive)) - log(value)));
+index = positive(localIndex);
 end
 
 function steps = line_search_steps(stepScale, multipliers)
@@ -1452,10 +1534,16 @@ end
 currentMultipliers = direct_candidate_multipliers(candidates(accepted(localIndex)));
 
 for scalarName = ["cl", "cw", "rat"]
+    key = char(scalarName);
+    if isstruct(scalarMultipliers)
+        currentScalarMultipliers = scalarMultipliers.(key);
+    else
+        currentScalarMultipliers = scalarMultipliers;
+    end
     trialTuples = struct([]);
-    for k = 1:numel(scalarMultipliers)
+    for k = 1:numel(currentScalarMultipliers)
         trial = currentMultipliers;
-        trial.(char(scalarName)) = scalarMultipliers(k);
+        trial.(key) = currentScalarMultipliers(k);
         trialTuples = append_struct(trialTuples, trial);
     end
     [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
@@ -1468,6 +1556,107 @@ for scalarName = ["cl", "cw", "rat"]
     if ~isempty(accepted)
         [~, localIndex] = min([candidates(accepted).objective]);
         currentMultipliers = direct_candidate_multipliers(candidates(accepted(localIndex)));
+    end
+end
+end
+
+function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_neighbor_candidates( ...
+    model, variables, gradient, diagnostic, targetBlocks, lastMultipliers, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+% Seed from the last accepted multiplier tuple, then widen each coordinate.
+
+basePreconditioner = rowband_direct_base_preconditioner( ...
+    gradient, diagnostic, targetBlocks, model.variableKeys);
+candidates = struct([]);
+candidate_variables = cell(0, 1);
+candidate_evaluations = cell(0, 1);
+currentMultipliers = direct_multiplier_tuple(lastMultipliers.field, lastMultipliers);
+
+for coordinateName = ["field", "cl", "cw", "rat"]
+    if coordinateName == "field"
+        ladder = effective_direct_field_multipliers();
+    else
+        ladder = effective_direct_scalar_multipliers();
+    end
+    coordinateSearchMode = stepSearchMode + "_" + coordinateName;
+    [newCandidates, newVariables, newEvaluations] = evaluate_direct_coordinate_neighbor_candidates( ...
+        model, variables, gradient, basePreconditioner, currentMultipliers, ...
+        coordinateName, ladder, baseObjective, baseComponents, opts, iteration, ...
+        coordinateSearchMode);
+    candidates = append_struct_array(candidates, newCandidates);
+    candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
+    candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
+
+    accepted = accepted_candidate_indices(candidates);
+    if ~isempty(accepted)
+        [~, localIndex] = min([candidates(accepted).objective]);
+        currentMultipliers = direct_candidate_multipliers(candidates(accepted(localIndex)));
+    end
+end
+end
+
+function [candidates, candidate_variables, candidate_evaluations] = evaluate_direct_coordinate_neighbor_candidates( ...
+    model, variables, gradient, basePreconditioner, centerMultipliers, coordinateName, ladder, ...
+    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+% Walk one direct multiplier ladder outward from a trusted coordinate value.
+
+coordinateName = string(coordinateName);
+centerIndex = nearest_direct_multiplier_index(ladder, centerMultipliers.(char(coordinateName)));
+currentIndices = neighbor_window_indices(centerIndex, numel(ladder));
+evaluated = false(1, numel(ladder));
+candidates = struct([]);
+candidate_variables = cell(0, 1);
+candidate_evaluations = cell(0, 1);
+
+while true
+    newIndices = currentIndices(~evaluated(currentIndices));
+    for index = newIndices
+        trial = centerMultipliers;
+        trial.(char(coordinateName)) = ladder(index);
+        [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
+            model, variables, gradient, basePreconditioner, trial, ...
+            baseObjective, baseComponents, opts, iteration, stepSearchMode);
+        for k = 1:numel(newCandidates)
+            newCandidates(k).direct_neighbor_coordinate = coordinateName;
+            newCandidates(k).direct_neighbor_index = index;
+        end
+        candidates = append_struct_array(candidates, newCandidates);
+        candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
+        candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
+        evaluated(index) = true;
+    end
+
+    if isempty(candidates)
+        accepted = [];
+        currentCandidates = struct([]);
+    else
+        currentMask = ismember([candidates.direct_neighbor_index], currentIndices);
+        currentCandidates = candidates(currentMask);
+        accepted = accepted_candidate_indices(currentCandidates);
+    end
+
+    if isempty(accepted)
+        expandedIndices = max(1, currentIndices(1) - 1):min(numel(ladder), currentIndices(end) + 1);
+        if isequal(expandedIndices, currentIndices)
+            break
+        end
+        currentIndices = expandedIndices;
+        continue
+    end
+
+    [~, localIndex] = min([currentCandidates(accepted).objective]);
+    best = currentCandidates(accepted(localIndex));
+    bestIndex = best.direct_neighbor_index;
+    if bestIndex == currentIndices(1) && bestIndex > 1
+        currentIndices = neighbor_window_indices(bestIndex, numel(ladder));
+    elseif bestIndex == currentIndices(end) && bestIndex < numel(ladder)
+        currentIndices = neighbor_window_indices(bestIndex, numel(ladder));
+    else
+        break
+    end
+
+    if all(evaluated(currentIndices))
+        break
     end
 end
 end
@@ -1531,6 +1720,8 @@ summary.iteration = iteration;
 summary.step_multiplier = multipliers.field;
 summary.step_multiplier_index = nearest_step_multiplier_index(effective_direct_field_multipliers(), multipliers.field);
 summary.step_search_mode = stepSearchMode;
+summary.direct_neighbor_coordinate = "";
+summary.direct_neighbor_index = NaN;
 summary.rowband_direct_multipliers = multipliers;
 summary.field_step_multiplier = multipliers.field;
 summary.cl_direct_multiplier = multipliers.cl;
@@ -1852,11 +2043,14 @@ output.gauge_errors_after = current_gauge_errors;
 output.gauge_projection = gauge_projection_for_mode(opts.mode);
 output.line_search_step_multipliers = effective_step_multipliers(opts);
 if opts.mode == "rowband_all"
-    output.rowband_scalar_update = "direct_gradient_coordinate_sweep";
+    output.rowband_scalar_update = opts.rowbandScalarUpdate;
+else
+    output.rowband_scalar_update = "global_line_search";
+end
+if use_direct_rowband_scalar_update(opts)
     output.direct_field_multipliers = effective_direct_field_multipliers();
     output.direct_scalar_multipliers = effective_direct_scalar_multipliers();
 else
-    output.rowband_scalar_update = "global_line_search";
     output.direct_field_multipliers = [];
     output.direct_scalar_multipliers = [];
 end
