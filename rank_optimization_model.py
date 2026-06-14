@@ -82,6 +82,7 @@ class Evaluation:
     """One full model evaluation cached at both field and residual levels."""
 
     objective: float
+    objective_components: dict[str, float]
     fields: dict[str, np.ndarray]
     residuals: dict[str, np.ndarray]
     core_cache: dict[str, dict[str, np.ndarray]]
@@ -426,19 +427,65 @@ class RankOptimizationModel:
             "u2x2": u2x2,
         }
         objective = 0.0
+        objective_components: dict[str, float] = {}
         if hasattr(self, "scales"):
-            objective = self.objective_from_residuals(residuals)
-        return Evaluation(objective=objective, fields=fields, residuals=residuals, core_cache=core_cache)
+            objective, objective_components = self.objective_and_components_from_residuals(residuals)
+        return Evaluation(
+            objective=objective,
+            objective_components=objective_components,
+            fields=fields,
+            residuals=residuals,
+            core_cache=core_cache,
+        )
+
+    def objective_components_from_residuals(self, residuals: dict[str, np.ndarray]) -> dict[str, float]:
+        """Return the four weighted objective components separately."""
+
+        fomega, fzeta, divergence, curl = self._objective_component_terms(residuals)
+        return {
+            "fomega": float(fomega),
+            "fzeta": float(fzeta),
+            "divergence": float(divergence),
+            "curl": float(curl),
+        }
+
+    def objective_and_components_from_residuals(
+        self,
+        residuals: dict[str, np.ndarray],
+    ) -> tuple[float, dict[str, float]]:
+        """Return objective and component losses from one residual pass."""
+
+        fomega, fzeta, divergence, curl = self._objective_component_terms(residuals)
+        objective = float(fomega + fzeta + divergence + curl)
+        components = {
+            "fomega": float(fomega),
+            "fzeta": float(fzeta),
+            "divergence": float(divergence),
+            "curl": float(curl),
+        }
+        return objective, components
+
+    def _objective_component_terms(
+        self,
+        residuals: dict[str, np.ndarray],
+    ) -> tuple[np.float64, np.float64, np.float64, np.float64]:
+        """Return raw component scalars without changing the old sum order."""
+
+        fomega = 0.5 * np.mean((residuals["fomega"] / self.scales["fomega"]) ** 2)
+        fzeta = 0.5 * np.mean((residuals["fzeta"] / self.scales["fzeta"]) ** 2)
+        divergence = (
+            0.5
+            * self.constraint_weight
+            * np.mean((residuals["divergence"] / self.scales["divergence"]) ** 2)
+        )
+        curl = 0.5 * self.constraint_weight * np.mean((residuals["curl"] / self.scales["curl"]) ** 2)
+        return fomega, fzeta, divergence, curl
 
     def objective_from_residuals(self, residuals: dict[str, np.ndarray]) -> float:
         """Return the weighted mean-square objective from residual arrays."""
 
-        return float(
-            0.5 * np.mean((residuals["fomega"] / self.scales["fomega"]) ** 2)
-            + 0.5 * np.mean((residuals["fzeta"] / self.scales["fzeta"]) ** 2)
-            + 0.5 * self.constraint_weight * np.mean((residuals["divergence"] / self.scales["divergence"]) ** 2)
-            + 0.5 * self.constraint_weight * np.mean((residuals["curl"] / self.scales["curl"]) ** 2)
-        )
+        objective, _ = self.objective_and_components_from_residuals(residuals)
+        return objective
 
     def objective(self, variables: VariableDict) -> float:
         return self.objective_from_residuals(self.evaluate(variables).residuals)

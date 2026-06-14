@@ -47,8 +47,9 @@ end
 % residuals in model.scales. That keeps the four equations comparable even
 % though the physical RMS sizes differ by many orders of magnitude.
 current_evaluation = evaluate_model(model, variables);
-initial_objective = objective_from_residuals(model, current_evaluation.residuals);
-initial_components = objective_components(model, current_evaluation.residuals);
+[initial_objective, initial_components] = objective_and_components(model, current_evaluation.residuals);
+current_objective = initial_objective;
+current_components = initial_components;
 initial_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 initial_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 step_scale = opts.initialStepScale;
@@ -66,13 +67,14 @@ if opts.checkpointPeriod > 0
 end
 
 for iteration = 1:opts.maxIterations
-    base_objective = objective_from_residuals(model, current_evaluation.residuals);
-    base_components = objective_components(model, current_evaluation.residuals);
+    base_objective = current_objective;
+    base_components = current_components;
     gradient = analytic_gradient(model, variables, current_evaluation);
     gradient_norm = variable_norm(gradient, model.variableKeys);
     last_gradient_norm = gradient_norm;
 
     if use_direct_rowband_scalar_update(opts)
+        direct_gauges = gauge_gradients(model, variables);
         scheduled_sweep = should_sweep_steps(opts, iteration);
         search_step_scale = 1.0;
         if scheduled_sweep || isempty(last_direct_multipliers)
@@ -80,19 +82,19 @@ for iteration = 1:opts.maxIterations
                 [candidates, candidate_variables, candidate_evaluations] = rowband_direct_neighbor_candidates( ...
                     model, variables, gradient, rowband_diagnostic, target_blocks, ...
                     last_direct_multipliers, base_objective, base_components, opts, iteration, ...
-                    "direct_sweep_neighbor");
+                    "direct_sweep_neighbor", direct_gauges);
             else
                 [field_multipliers, scalar_multipliers, direct_search_mode] = direct_sweep_multipliers( ...
                     opts, last_direct_multipliers, iteration, "direct_sweep");
                 [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
                     model, variables, gradient, rowband_diagnostic, target_blocks, ...
                     field_multipliers, scalar_multipliers, ...
-                    base_objective, base_components, opts, iteration, direct_search_mode);
+                    base_objective, base_components, opts, iteration, direct_search_mode, direct_gauges);
             end
         else
             [candidates, candidate_variables, candidate_evaluations] = rowband_direct_single_candidate( ...
                 model, variables, gradient, rowband_diagnostic, target_blocks, ...
-                last_direct_multipliers, base_objective, base_components, opts, iteration);
+                last_direct_multipliers, base_objective, base_components, opts, iteration, direct_gauges);
         end
     else
         [raw_direction, preconditioner] = raw_direction_for_mode( ...
@@ -139,7 +141,7 @@ for iteration = 1:opts.maxIterations
             [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
                 model, variables, gradient, rowband_diagnostic, target_blocks, ...
                 effective_direct_field_multipliers(), effective_direct_scalar_multipliers(), ...
-                base_objective, base_components, opts, iteration, "direct_recovery_sweep");
+                base_objective, base_components, opts, iteration, "direct_recovery_sweep", direct_gauges);
         else
             [candidates, candidate_variables, candidate_evaluations] = evaluate_step_candidates( ...
                 model, variables, direction, search_step_scale, effective_step_multipliers(opts), ...
@@ -159,6 +161,8 @@ for iteration = 1:opts.maxIterations
     best = candidates(accepted_index);
     variables = candidate_variables{accepted_index};
     current_evaluation = candidate_evaluations{accepted_index};
+    current_objective = best.objective;
+    current_components = best.objective_components;
     step_scale = best.step;
     last_step_multiplier = best.step_multiplier;
     if use_direct_rowband_scalar_update(opts)
@@ -170,7 +174,7 @@ for iteration = 1:opts.maxIterations
     end
     residuals = residual_rms_from_residuals(current_evaluation.residuals);
     gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
-    components = best.objective_components;
+    components = current_components;
 
     row = history_row( ...
         iteration, best.objective, best.objective_change, best.step, ...
@@ -193,6 +197,7 @@ for iteration = 1:opts.maxIterations
     if should_write_checkpoint(opts, numel(history))
         write_checkpoint( ...
             paths, variables, history, current_evaluation, ...
+            current_objective, current_components, ...
             initial_objective, initial_components, initial_residuals, ...
             initial_gauge_errors, model, opts, target_blocks, iteration, ...
             step_scale, last_step_multiplier);
@@ -205,8 +210,8 @@ for iteration = 1:opts.maxIterations
     end
 end
 
-final_objective = objective_from_residuals(model, current_evaluation.residuals);
-final_components = objective_components(model, current_evaluation.residuals);
+final_objective = current_objective;
+final_components = current_components;
 final_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 final_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 accepted_count = numel(history);
@@ -1120,10 +1125,7 @@ function value = objective_from_residuals(model, residuals)
 % The objective is a normalized least-squares loss. Divergence and curl share
 % the constraintWeight knob so their influence can be damped or emphasized.
 
-value = 0.5 * mean((residuals.fomega ./ model.scales.fomega) .^ 2, "all") ...
-    + 0.5 * mean((residuals.fzeta ./ model.scales.fzeta) .^ 2, "all") ...
-    + 0.5 * model.constraintWeight * mean((residuals.divergence ./ model.scales.divergence) .^ 2, "all") ...
-    + 0.5 * model.constraintWeight * mean((residuals.curl ./ model.scales.curl) .^ 2, "all");
+[value, ~] = objective_and_components(model, residuals);
 end
 
 function components = objective_components(model, residuals)
@@ -1136,6 +1138,13 @@ components.divergence = 0.5 * model.constraintWeight * ...
     mean((residuals.divergence ./ model.scales.divergence) .^ 2, "all");
 components.curl = 0.5 * model.constraintWeight * ...
     mean((residuals.curl ./ model.scales.curl) .^ 2, "all");
+end
+
+function [value, components] = objective_and_components(model, residuals)
+% Compute the four least-squares components once and sum them into J.
+
+components = objective_components(model, residuals);
+value = components.fomega + components.fzeta + components.divergence + components.curl;
 end
 
 function out = residual_rms_from_residuals(residuals)
@@ -1369,10 +1378,12 @@ for i = 1:2
 end
 end
 
-function projected = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner)
+function projected = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner, gauges)
 % Build d = -B(g + A*lambda), with A' d = 0 and g' d <= 0.
 
-gauges = gauge_gradients(model, variables);
+if nargin < 5 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 names = ["omega_x1_00", "theta_x1x1_00"];
 preconditionedGradient = apply_rowband_preconditioner(gradient, preconditioner, model.variableKeys);
 projected = scale_variables(preconditionedGradient, -1.0, model.variableKeys);
@@ -1402,6 +1413,64 @@ for i = 1:2
     for key = model.variableKeys
         key = char(key);
         projected.(key) = projected.(key) - correction(i) * gauge_step.(key);
+    end
+end
+end
+
+function projected = direct_preconditioned_projected_tangent_direction(model, variables, gradient, basePreconditioner, multipliers, gauges)
+% Direct scalar trials share raw gauge gradients but use multiplier-specific B.
+
+if nargin < 6 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
+names = ["omega_x1_00", "theta_x1x1_00"];
+preconditionedGradient = apply_direct_preconditioner(gradient, basePreconditioner, multipliers, model.variableKeys);
+projected = scale_variables(preconditionedGradient, -1.0, model.variableKeys);
+
+preconditionedGauges = struct();
+for i = 1:2
+    preconditionedGauges.(names(i)) = apply_direct_preconditioner( ...
+        gauges.(names(i)), basePreconditioner, multipliers, model.variableKeys);
+end
+
+gram = zeros(2, 2);
+rhs = zeros(2, 1);
+for i = 1:2
+    rhs(i) = variable_dot(gauges.(names(i)), projected, model.variableKeys);
+    for j = 1:2
+        gram(i, j) = variable_dot(gauges.(names(i)), preconditionedGauges.(names(j)), model.variableKeys);
+    end
+end
+if cond(gram) > 1.0e14
+    correction = pinv(gram) * rhs;
+else
+    correction = gram \ rhs;
+end
+
+for i = 1:2
+    gauge_step = preconditionedGauges.(names(i));
+    for key = model.variableKeys
+        key = char(key);
+        projected.(key) = projected.(key) - correction(i) * gauge_step.(key);
+    end
+end
+end
+
+function out = apply_direct_preconditioner(variables, basePreconditioner, multipliers, keys)
+% Apply the direct row-band metric without rebuilding a full preconditioner.
+
+out = zero_like_variables(variables, keys);
+for keyName = keys
+    key = char(keyName);
+    switch key
+        case 'cl'
+            out.(key) = multipliers.cl .* variables.(key);
+        case 'cw'
+            out.(key) = multipliers.cw .* variables.(key);
+        case 'rat'
+            out.(key) = multipliers.rat .* variables.(key);
+        otherwise
+            out.(key) = (multipliers.field * basePreconditioner.(key)) .* variables.(key);
     end
 end
 end
@@ -1506,9 +1575,12 @@ end
 
 function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_coordinate_candidates( ...
     model, variables, gradient, diagnostic, targetBlocks, fieldMultipliers, scalarMultipliers, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges)
 % No-duplicate direct search: field-only seed, then cl/cw/rat in turn.
 
+if nargin < 13 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 basePreconditioner = rowband_direct_base_preconditioner( ...
     gradient, diagnostic, targetBlocks, model.variableKeys);
 candidates = struct([]);
@@ -1521,7 +1593,7 @@ for k = 1:numel(fieldMultipliers)
 end
 [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
     model, variables, gradient, basePreconditioner, seedTuples, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode);
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges);
 candidates = append_struct_array(candidates, newCandidates);
 candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
 candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
@@ -1548,7 +1620,7 @@ for scalarName = ["cl", "cw", "rat"]
     end
     [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
         model, variables, gradient, basePreconditioner, trialTuples, ...
-        baseObjective, baseComponents, opts, iteration, stepSearchMode + "_" + scalarName);
+        baseObjective, baseComponents, opts, iteration, stepSearchMode + "_" + scalarName, gauges);
     candidates = append_struct_array(candidates, newCandidates);
     candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
     candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
@@ -1562,9 +1634,12 @@ end
 
 function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_neighbor_candidates( ...
     model, variables, gradient, diagnostic, targetBlocks, lastMultipliers, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges)
 % Seed from the last accepted multiplier tuple, then widen each coordinate.
 
+if nargin < 12 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 basePreconditioner = rowband_direct_base_preconditioner( ...
     gradient, diagnostic, targetBlocks, model.variableKeys);
 candidates = struct([]);
@@ -1582,7 +1657,7 @@ for coordinateName = ["field", "cl", "cw", "rat"]
     [newCandidates, newVariables, newEvaluations] = evaluate_direct_coordinate_neighbor_candidates( ...
         model, variables, gradient, basePreconditioner, currentMultipliers, ...
         coordinateName, ladder, baseObjective, baseComponents, opts, iteration, ...
-        coordinateSearchMode);
+        coordinateSearchMode, gauges);
     candidates = append_struct_array(candidates, newCandidates);
     candidate_variables = [candidate_variables; newVariables]; %#ok<AGROW>
     candidate_evaluations = [candidate_evaluations; newEvaluations]; %#ok<AGROW>
@@ -1597,9 +1672,12 @@ end
 
 function [candidates, candidate_variables, candidate_evaluations] = evaluate_direct_coordinate_neighbor_candidates( ...
     model, variables, gradient, basePreconditioner, centerMultipliers, coordinateName, ladder, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges)
 % Walk one direct multiplier ladder outward from a trusted coordinate value.
 
+if nargin < 13 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 coordinateName = string(coordinateName);
 centerIndex = nearest_direct_multiplier_index(ladder, centerMultipliers.(char(coordinateName)));
 currentIndices = neighbor_window_indices(centerIndex, numel(ladder));
@@ -1615,7 +1693,7 @@ while true
         trial.(char(coordinateName)) = ladder(index);
         [newCandidates, newVariables, newEvaluations] = evaluate_direct_tuple_candidates( ...
             model, variables, gradient, basePreconditioner, trial, ...
-            baseObjective, baseComponents, opts, iteration, stepSearchMode);
+            baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges);
         for k = 1:numel(newCandidates)
             newCandidates(k).direct_neighbor_coordinate = coordinateName;
             newCandidates(k).direct_neighbor_index = index;
@@ -1663,28 +1741,34 @@ end
 
 function [candidates, candidate_variables, candidate_evaluations] = rowband_direct_single_candidate( ...
     model, variables, gradient, diagnostic, targetBlocks, multipliers, ...
-    baseObjective, baseComponents, opts, iteration)
+    baseObjective, baseComponents, opts, iteration, gauges)
 % Evaluate the trusted direct multiplier tuple once.
 
+if nargin < 11 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 basePreconditioner = rowband_direct_base_preconditioner( ...
     gradient, diagnostic, targetBlocks, model.variableKeys);
 [candidates, candidate_variables, candidate_evaluations] = evaluate_direct_tuple_candidates( ...
     model, variables, gradient, basePreconditioner, multipliers, ...
-    baseObjective, baseComponents, opts, iteration, "direct_single");
+    baseObjective, baseComponents, opts, iteration, "direct_single", gauges);
 end
 
 function [candidates, candidate_variables, candidate_evaluations] = evaluate_direct_tuple_candidates( ...
     model, variables, gradient, basePreconditioner, multiplierTuples, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges)
 % Evaluate row-band direct tuples, skipping non-descent degeneracies.
 
+if nargin < 11 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
 candidates = struct([]);
 candidate_variables = cell(0, 1);
 candidate_evaluations = cell(0, 1);
 for k = 1:numel(multiplierTuples)
     [summary, candidate, candidate_evaluation, ok] = direct_candidate( ...
         model, variables, gradient, basePreconditioner, multiplierTuples(k), ...
-        baseObjective, baseComponents, opts, iteration, stepSearchMode);
+        baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges);
     if ~ok
         continue
     end
@@ -1696,11 +1780,14 @@ end
 
 function [summary, candidate, candidate_evaluation, ok] = direct_candidate( ...
     model, variables, gradient, basePreconditioner, multipliers, ...
-    baseObjective, baseComponents, opts, iteration, stepSearchMode)
+    baseObjective, baseComponents, opts, iteration, stepSearchMode, gauges)
 % Build one direct-scalar preconditioned candidate.
 
-preconditioner = rowband_direct_preconditioner(basePreconditioner, multipliers, model.variableKeys);
-tangent_direction = preconditioned_projected_tangent_direction(model, variables, gradient, preconditioner);
+if nargin < 11 || isempty(gauges)
+    gauges = gauge_gradients(model, variables);
+end
+tangent_direction = direct_preconditioned_projected_tangent_direction( ...
+    model, variables, gradient, basePreconditioner, multipliers, gauges);
 [direction, projected_gradient_norm] = normalize_direction(tangent_direction, model.variableKeys);
 summary = struct();
 candidate = struct();
@@ -1836,8 +1923,7 @@ function [summary, candidate, candidate_evaluation] = candidate_summary(model, b
 candidate = add_scaled_variables(base_variables, direction, step, model.variableKeys);
 candidate = retract_variables(model, candidate, false, 1.0e-10);
 candidate_evaluation = evaluate_model(model, candidate);
-candidate_objective = objective_from_residuals(model, candidate_evaluation.residuals);
-components = objective_components(model, candidate_evaluation.residuals);
+[candidate_objective, components] = objective_and_components(model, candidate_evaluation.residuals);
 gauge_errors = gauge_errors_from_fields(model, candidate_evaluation.fields);
 objective_change = candidate_objective - base_objective;
 summary = struct();
@@ -2004,23 +2090,21 @@ else
 end
 end
 
-function write_checkpoint(paths, variables, history, current_evaluation, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
+function write_checkpoint(paths, variables, history, current_evaluation, current_objective, current_components, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
 % Write a restart state plus lightweight partial results for long runs.
 
 save(paths.checkpointState, "-struct", "variables", "-v7.3");
 write_history_csv(paths.checkpointHistory, history);
 checkpoint = checkpoint_output( ...
-    paths, history, current_evaluation, initial_objective, initial_components, ...
-    initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, ...
-    stepScale, lastStepMultiplier);
+    paths, history, current_evaluation, current_objective, current_components, ...
+    initial_objective, initial_components, initial_residuals, initial_gauge_errors, ...
+    model, opts, target_blocks, iteration, stepScale, lastStepMultiplier);
 write_json(paths.checkpointResults, checkpoint);
 end
 
-function output = checkpoint_output(paths, history, current_evaluation, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
+function output = checkpoint_output(paths, history, current_evaluation, current_objective, current_components, initial_objective, initial_components, initial_residuals, initial_gauge_errors, model, opts, target_blocks, iteration, stepScale, lastStepMultiplier)
 % Build a compact checkpoint JSON.  Candidate history is intentionally omitted.
 
-current_objective = objective_from_residuals(model, current_evaluation.residuals);
-current_components = objective_components(model, current_evaluation.residuals);
 current_residuals = residual_rms_from_residuals(current_evaluation.residuals);
 current_gauge_errors = gauge_errors_from_fields(model, current_evaluation.fields);
 output = struct();

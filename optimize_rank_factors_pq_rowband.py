@@ -115,20 +115,7 @@ def load_state(path: Path) -> VariableDict:
 def objective_components(model: RankOptimizationModel, residuals: dict[str, np.ndarray]) -> dict[str, float]:
     """Return the four weighted objective components separately."""
 
-    return {
-        "fomega": float(0.5 * np.mean((residuals["fomega"] / model.scales["fomega"]) ** 2)),
-        "fzeta": float(0.5 * np.mean((residuals["fzeta"] / model.scales["fzeta"]) ** 2)),
-        "divergence": float(
-            0.5
-            * model.constraint_weight
-            * np.mean((residuals["divergence"] / model.scales["divergence"]) ** 2)
-        ),
-        "curl": float(
-            0.5
-            * model.constraint_weight
-            * np.mean((residuals["curl"] / model.scales["curl"]) ** 2)
-        ),
-    }
+    return model.objective_components_from_residuals(residuals)
 
 
 def zero_like_variables(variables: VariableDict) -> VariableDict:
@@ -343,6 +330,27 @@ def rowband_direct_preconditioner(
     return out
 
 
+def apply_direct_preconditioner(
+    values: VariableDict,
+    base_preconditioner: VariableDict,
+    multipliers: dict[str, float],
+) -> VariableDict:
+    """Apply direct field/scalar multipliers without rebuilding a metric."""
+
+    out = zero_like_variables(values)
+    field_multiplier = float(multipliers["field"])
+    for key, value in values.items():
+        if key in SCALAR_BLOCKS:
+            scale = float(multipliers.get(key, 0.0))
+            out[key] = scale * float(value)
+        else:
+            scale = base_preconditioner[key]
+            assert isinstance(value, np.ndarray)
+            assert isinstance(scale, np.ndarray)
+            out[key] = field_multiplier * scale * value
+    return out
+
+
 def direct_multiplier_tuple(field: float, scalars: dict[str, float] | None = None) -> dict[str, float]:
     """Normalize direct row-band multiplier dictionaries for JSON/history."""
 
@@ -417,6 +425,7 @@ def preconditioned_projected_tangent_direction(
     variables: VariableDict,
     gradient: VariableDict,
     preconditioner: VariableDict,
+    gauges: dict[str, VariableDict] | None = None,
 ) -> VariableDict:
     """Build ``d = -B(g + A lambda)`` with ``A.T d = 0``.
 
@@ -425,7 +434,8 @@ def preconditioned_projected_tangent_direction(
     the preconditioned direction after gauge projection.
     """
 
-    gauges = model.gauge_gradients(variables)
+    if gauges is None:
+        gauges = model.gauge_gradients(variables)
     names = ["omega_x1_00", "theta_x1x1_00"]
     preconditioned_gradient = apply_rowband_preconditioner(gradient, preconditioner)
     projected: VariableDict = {
@@ -434,6 +444,53 @@ def preconditioned_projected_tangent_direction(
     }
     preconditioned_gauges = {
         name: apply_rowband_preconditioner(gauges[name], preconditioner)
+        for name in names
+    }
+    gram = np.array(
+        [
+            [variable_dot(gauges[left], preconditioned_gauges[right]) for right in names]
+            for left in names
+        ],
+        dtype=float,
+    )
+    rhs = np.array([variable_dot(gauges[name], projected) for name in names], dtype=float)
+    if np.linalg.cond(gram) > 1.0e14:
+        correction = np.linalg.pinv(gram) @ rhs
+    else:
+        correction = np.linalg.solve(gram, rhs)
+
+    for coefficient, name in zip(correction, names):
+        gauge_step = preconditioned_gauges[name]
+        for key, value in projected.items():
+            step_value = gauge_step[key]
+            if isinstance(value, np.ndarray):
+                assert isinstance(step_value, np.ndarray)
+                value -= coefficient * step_value
+            else:
+                projected[key] = float(value) - float(coefficient) * float(step_value)
+    return projected
+
+
+def direct_preconditioned_projected_tangent_direction(
+    model: RankOptimizationModel,
+    variables: VariableDict,
+    gradient: VariableDict,
+    base_preconditioner: VariableDict,
+    multipliers: dict[str, float],
+    gauges: dict[str, VariableDict] | None = None,
+) -> VariableDict:
+    """Build the direct-scalar projected row-band direction for one tuple."""
+
+    if gauges is None:
+        gauges = model.gauge_gradients(variables)
+    names = ["omega_x1_00", "theta_x1x1_00"]
+    preconditioned_gradient = apply_direct_preconditioner(gradient, base_preconditioner, multipliers)
+    projected: VariableDict = {
+        key: -value if isinstance(value, np.ndarray) else -float(value)
+        for key, value in preconditioned_gradient.items()
+    }
+    preconditioned_gauges = {
+        name: apply_direct_preconditioner(gauges[name], base_preconditioner, multipliers)
         for name in names
     }
     gram = np.array(
@@ -628,7 +685,7 @@ def candidate_with_components(
         step,
         base_objective,
     )
-    components = objective_components(model, evaluation.residuals)
+    components = evaluation.objective_components
     summary["objective_components"] = components
     summary["objective_component_changes"] = {
         key: components[key] - base_components[key]
@@ -643,6 +700,7 @@ def direct_candidate_with_components(
     variables: VariableDict,
     gradient: VariableDict,
     base_preconditioner: VariableDict,
+    gauges: dict[str, VariableDict],
     multipliers: dict[str, float],
     base_objective: float,
     base_components: dict[str, float],
@@ -651,12 +709,13 @@ def direct_candidate_with_components(
 ) -> tuple[dict[str, Any], VariableDict, Evaluation] | None:
     """Evaluate one direct-scalar row-band multiplier tuple."""
 
-    preconditioner = rowband_direct_preconditioner(base_preconditioner, multipliers)
-    tangent_direction = preconditioned_projected_tangent_direction(
+    tangent_direction = direct_preconditioned_projected_tangent_direction(
         model,
         variables,
         gradient,
-        preconditioner,
+        base_preconditioner,
+        multipliers,
+        gauges,
     )
     direction, direction_norm = normalize_direction(tangent_direction)
     if direction_norm == 0.0:
@@ -696,6 +755,7 @@ def evaluate_direct_tuple_candidates(
     variables: VariableDict,
     gradient: VariableDict,
     base_preconditioner: VariableDict,
+    gauges: dict[str, VariableDict],
     multiplier_tuples: list[dict[str, float]],
     base_objective: float,
     base_components: dict[str, float],
@@ -718,6 +778,7 @@ def evaluate_direct_tuple_candidates(
             variables=variables,
             gradient=gradient,
             base_preconditioner=base_preconditioner,
+            gauges=gauges,
             multipliers=multipliers,
             base_objective=base_objective,
             base_components=base_components,
@@ -748,6 +809,7 @@ def rowband_direct_coordinate_candidates(
     model: RankOptimizationModel,
     variables: VariableDict,
     gradient: VariableDict,
+    gauges: dict[str, VariableDict],
     rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
     field_multipliers: list[float],
@@ -778,6 +840,7 @@ def rowband_direct_coordinate_candidates(
         variables=variables,
         gradient=gradient,
         base_preconditioner=base_preconditioner,
+        gauges=gauges,
         multiplier_tuples=seed_tuples,
         base_objective=base_objective,
         base_components=base_components,
@@ -808,6 +871,7 @@ def rowband_direct_coordinate_candidates(
             variables=variables,
             gradient=gradient,
             base_preconditioner=base_preconditioner,
+            gauges=gauges,
             multiplier_tuples=trial_tuples,
             base_objective=base_objective,
             base_components=base_components,
@@ -829,6 +893,7 @@ def rowband_direct_neighbor_candidates(
     model: RankOptimizationModel,
     variables: VariableDict,
     gradient: VariableDict,
+    gauges: dict[str, VariableDict],
     rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
     last_multipliers: dict[str, float],
@@ -864,6 +929,7 @@ def rowband_direct_neighbor_candidates(
             variables=variables,
             gradient=gradient,
             base_preconditioner=base_preconditioner,
+            gauges=gauges,
             center_multipliers=current_multipliers,
             coordinate=coordinate,
             ladder=ladder,
@@ -888,6 +954,7 @@ def evaluate_direct_coordinate_neighbor_candidates(
     variables: VariableDict,
     gradient: VariableDict,
     base_preconditioner: VariableDict,
+    gauges: dict[str, VariableDict],
     center_multipliers: dict[str, float],
     coordinate: str,
     ladder: list[float],
@@ -915,6 +982,7 @@ def evaluate_direct_coordinate_neighbor_candidates(
                 variables=variables,
                 gradient=gradient,
                 base_preconditioner=base_preconditioner,
+                gauges=gauges,
                 multiplier_tuples=[trial],
                 base_objective=base_objective,
                 base_components=base_components,
@@ -968,6 +1036,7 @@ def rowband_direct_single_candidate(
     model: RankOptimizationModel,
     variables: VariableDict,
     gradient: VariableDict,
+    gauges: dict[str, VariableDict],
     rowband_diagnostic: dict[str, Any],
     target_blocks: tuple[str, ...],
     multipliers: dict[str, float],
@@ -988,6 +1057,7 @@ def rowband_direct_single_candidate(
         variables=variables,
         gradient=gradient,
         base_preconditioner=base_preconditioner,
+        gauges=gauges,
         multiplier_tuples=[multipliers],
         base_objective=base_objective,
         base_components=base_components,
@@ -1178,8 +1248,10 @@ def run_optimizer(
         rowband_diagnostic = json.loads(rowband_diagnostic_path.read_text(encoding="utf-8"))
 
     current_evaluation = model.evaluate(variables)
-    initial_objective = model.objective_from_residuals(current_evaluation.residuals)
-    initial_components = objective_components(model, current_evaluation.residuals)
+    initial_objective = current_evaluation.objective
+    initial_components = current_evaluation.objective_components
+    current_objective = initial_objective
+    current_components = initial_components
     initial_residuals = residual_rms_summary(model, current_evaluation)
     initial_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     step_scale = initial_step_scale
@@ -1199,13 +1271,14 @@ def run_optimizer(
     paths = output_paths(output_prefix)
 
     for iteration in range(1, max_iterations + 1):
-        base_objective = model.objective_from_residuals(current_evaluation.residuals)
-        base_components = objective_components(model, current_evaluation.residuals)
+        base_objective = current_objective
+        base_components = current_components
         gradient = model.analytic_gradient(variables, evaluation=current_evaluation)
         gradient_norm = variable_norm(gradient)
         if direct_rowband_update:
             if rowband_diagnostic is None:
                 raise ValueError("rowband_all mode requires an all-variable diagnostic JSON")
+            direct_gauges = model.gauge_gradients(variables)
             scheduled_sweep = should_sweep_steps(
                 iteration,
                 step_sweep_initial_iterations=step_sweep_initial_iterations,
@@ -1223,6 +1296,7 @@ def run_optimizer(
                         model=model,
                         variables=variables,
                         gradient=gradient,
+                        gauges=direct_gauges,
                         rowband_diagnostic=rowband_diagnostic,
                         target_blocks=target_blocks,
                         last_multipliers=last_direct_multipliers,
@@ -1243,6 +1317,7 @@ def run_optimizer(
                         model=model,
                         variables=variables,
                         gradient=gradient,
+                        gauges=direct_gauges,
                         rowband_diagnostic=rowband_diagnostic,
                         target_blocks=target_blocks,
                         field_multipliers=field_multipliers,
@@ -1257,6 +1332,7 @@ def run_optimizer(
                     model=model,
                     variables=variables,
                     gradient=gradient,
+                    gauges=direct_gauges,
                     rowband_diagnostic=rowband_diagnostic,
                     target_blocks=target_blocks,
                     multipliers=last_direct_multipliers,
@@ -1326,6 +1402,7 @@ def run_optimizer(
                     model=model,
                     variables=variables,
                     gradient=gradient,
+                    gauges=direct_gauges,
                     rowband_diagnostic=rowband_diagnostic,
                     target_blocks=target_blocks,
                     field_multipliers=effective_direct_field_multipliers(),
@@ -1360,6 +1437,8 @@ def run_optimizer(
         best = candidates[accepted_index]
         variables = accepted_variables
         current_evaluation = candidate_evaluations[accepted_index]
+        current_objective = float(best["objective"])
+        current_components = best["objective_components"]
         # Preserve the best accepted scalar as the next trusted multiplier.
         # Row-band mode resets the physical scale from the natural direction
         # norm each iteration, while still reusing this multiplier.
@@ -1414,8 +1493,8 @@ def run_optimizer(
             stop_reason = "accepted decrease fell below the minimum improvement"
             break
 
-    final_objective = model.objective_from_residuals(current_evaluation.residuals)
-    final_components = objective_components(model, current_evaluation.residuals)
+    final_objective = current_objective
+    final_components = current_components
     final_residuals = residual_rms_summary(model, current_evaluation)
     final_gauge_errors = model.gauge_errors_from_fields(current_evaluation.fields)
     accepted_count = len(history)

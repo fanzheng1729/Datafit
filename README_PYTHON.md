@@ -32,7 +32,9 @@ row-band experiment:
 - `rank_optimizer_helpers.py`: shared candidate evaluation, line-search,
   history, and state persistence helpers.
 - `optimize_rank_factors_pq_rowband.py`: saved-state row-band optimizer with
-  preconditioned fixed-gauge projection in `rowband_all`.
+  preconditioned fixed-gauge projection in `rowband_all`. It supports both the
+  current direct scalar-coordinate sweep and the previous shared global
+  line-search sweep.
 - `diagnose_pq_support_step_scaling.py`: all-variable row-band safe-step
   diagnostic generator.
 - `gradient_check_rank.py`, `check_retraction_refit.py`, and
@@ -57,27 +59,79 @@ Current defaults are:
 - `--max-iterations 30`
 - `--state from_begin_initial_state.npz`
 - `--rowband-diagnostic all_variable_rowband_step_scaling_diagnostic_results.json`
-- `--step-sweep-initial-iterations 5`
-- `--step-sweep-period 5`
+- `--rowband-scalar-update direct_gradient_coordinate_sweep`
+- `--step-sweep-initial-iterations 2`
+- `--step-sweep-period 20`
 - `--step-sweep-mode neighbor`
+- `--step-sweep-start-multiplier 1.0`
 
-Row-band modes use the measured natural direction norm with the standard
-seven-point multiplier ladder.
+Global row-band mode uses the measured natural direction norm with the
+standard seven-point multiplier ladder. Direct scalar mode uses separate field
+and scalar multiplier ladders described below.
 
-The retained Python result artifacts aligned with this path are:
+`--rowband-scalar-update direct_gradient_coordinate_sweep` is the current
+default. It starts with two full direct coordinate sweeps:
 
-- `from_begin_initial_state.npz`
-- `all_variable_rowband_step_scaling_diagnostic_results.json`
-- `from_begin_rat_w0p007_updated_diag_30_results.json`
-- `from_begin_rat_w0p007_updated_diag_30_history.csv`
-- `from_begin_rat_w0p007_updated_diag_30_state.npz`
+```text
+1. field-only multiplier sweep
+2. cl multiplier sweep
+3. cw multiplier sweep
+4. rat multiplier sweep
+```
+
+After the two warmup sweeps, unscheduled iterations reuse the last accepted
+direct tuple `(field, cl, cw, rat)`. On scheduled iterations 20, 40, 60, ...
+the neighbor search starts from that tuple and adaptively widens each
+coordinate window if no local candidate is accepted or the best accepted
+candidate is on the edge.
+
+Use the previous shared global line search with:
+
+```powershell
+python optimize_rank_factors_pq_rowband.py -n 30 --rowband-scalar-update global_line_search --output-prefix py_global_neighbor_check
+```
+
+In global mode, all variables share one projected row-band direction and one
+step multiplier from:
+
+```text
+[10, 3, 1, 0.3, 0.1, 0.03, 0.01]
+```
 
 The updated diagnostic includes `rat`, uses constraint weight `0.007`, and
-comes from `from_begin_initial_state.npz`. The recorded check reduces `J` from
-`1.0070000000` to `0.1807256857`.
+comes from `from_begin_initial_state.npz`.
+
+By default, the Python optimizer writes:
+
+```text
+rowband_all_rank_optimization_results.json
+rowband_all_rank_optimization_history.csv
+rowband_all_rank_optimization_state.npz
+```
+
+Python writes final artifacts only. It does not currently write periodic
+checkpoint files during the run, so use the MATLAB wrapper for unattended
+overnight runs that need checkpoint monitoring and resumability. Use Python for
+parity checks, shorter optimizer tests, and inspecting the same algorithm in a
+more compact implementation.
+
+Recent from-begin checks from `J ~= 1.007`:
+
+```text
+Direct default, 20 accepted steps:
+  J = 1.0070000000 -> 0.1267376768
+  iteration 20 used adaptive direct-neighbor search with 13 trials
+
+Global neighbor, 30 accepted steps:
+  J = 1.0070000000 -> 0.1242733102
+  direct scalar ladders were empty, confirming the global path
+```
 
 To regenerate the all-variable row-band diagnostic:
 
 ```powershell
 python diagnose_pq_support_step_scaling.py
 ```
+
+For the checkpointed overnight MATLAB runbook, see `README.md`, section
+`MATLAB Row-Band Optimizer`.

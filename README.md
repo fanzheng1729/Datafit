@@ -58,8 +58,9 @@ u1_x2 - u2_x1 = omega
   as the Python optimizer.
 - `optimize_rank_factors_pq_rowband.m`: MATLAB wrapper for the current
   rat-enabled all-variable row-band optimizer setup. It reuses
-  `optimize_rank_factors.m` and defaults to `constraintWeight = 0.007` with a
-  neighbor scheduled step sweep.
+  `optimize_rank_factors.m` and defaults to `constraintWeight = 0.007`,
+  direct scalar-coordinate sweeps, two initial full sweeps, and an adaptive
+  neighbor scheduled sweep every 20 accepted iterations.
 - `runfit.py`: Python equivalent of the MATLAB fit/check path. See
   `README_PYTHON.md` for MAT-file loading and implementation details.
 - `data.mat`: saved profile data, grids, velocity data, far-field coefficients,
@@ -129,7 +130,9 @@ with, the Python optimizer.
 
 ### MATLAB Row-Band Optimizer
 
-The current row-band setup has a MATLAB wrapper:
+The current row-band setup has a MATLAB wrapper. This is the recommended entry
+point for long runs because MATLAB is faster on these optimizer tests and the
+MATLAB path supports periodic checkpoints.
 
 ```powershell
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband();"
@@ -142,19 +145,67 @@ the other row-band defaults:
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(2);"
 ```
 
-The wrapper defaults to `Mode = rowband_all`, `ConstraintWeight = 0.007`, and
-`MaxIterations = 30`. Row-band modes always start the line search from the
-measured natural row-band direction norm and use the standard seven-point
-multiplier ladder. The wrapper also uses `StepSweepInitialIterations = 5`,
-`StepSweepPeriod = 5`, and `StepSweepMode = "neighbor"`. On scheduled sweep
-iterations, the optimizer starts from the last accepted step multiplier, tests
-the adjacent larger/smaller multipliers on the ladder, and keeps walking only
-if the best accepted candidate is at the edge of the local bracket. On
-intervening iterations it uses the last accepted multiplier directly. If that
-single trusted step fails, `RecoveryStepSweep = true` falls back to one full
-bracket sweep for that iteration. The wrapper starts from the canonical
-`data.mat` fit and reads the rat-enabled all-variable diagnostic
+The wrapper defaults are:
+
+```text
+Mode                         rowband_all
+StatePath                    ""  (start from the canonical data.mat fit)
+RowbandDiagnostic            all_variable_rowband_step_scaling_diagnostic_results.json
+MaxIterations                30
+OutputPrefix                 matlab_from_begin_rat_w0p007_updated_diag_30
+ConstraintWeight             0.007
+RowbandScalarUpdate          direct_gradient_coordinate_sweep
+StepSweepInitialIterations   2
+StepSweepPeriod              20
+StepSweepMode                neighbor
+StepSweepStartMultiplier     1
+RecoveryStepSweep            true
+```
+
+With `StatePath = ""`, the objective starts near `J = 1.007`. The optimizer
+tracks `omega`, `zeta`, `u1`, `u2`, `cl`, `cw`, and `rat`; `rat` is the
+far-field velocity multiplier. The row-band diagnostic must include all of
+those target blocks, and the current diagnostic is
 `all_variable_rowband_step_scaling_diagnostic_results.json`.
+
+#### Scalar Update Modes
+
+`RowbandScalarUpdate = "direct_gradient_coordinate_sweep"` is the current
+default. It builds a row-band field preconditioner, disables scalar movement for
+the first seed, then refines one scalar at a time:
+
+```text
+1. field-only multiplier sweep
+2. cl multiplier sweep
+3. cw multiplier sweep
+4. rat multiplier sweep
+```
+
+The first two scheduled sweeps are full direct sweeps. A successful full direct
+sweep usually evaluates `13 + 22 + 22 + 22 = 79` candidates: 13 field
+multipliers and 22 scalar multipliers for each of `cl`, `cw`, and `rat`.
+After that, unscheduled iterations reuse the last accepted direct tuple. On
+scheduled iterations 20, 40, 60, ... with `StepSweepMode = "neighbor"`, the
+optimizer starts from the last accepted tuple `(field, cl, cw, rat)` and walks
+each coordinate ladder outward. It widens the local window if no local candidate
+is accepted or if the best accepted candidate is on a window edge.
+
+Use `RowbandScalarUpdate = "global_line_search"` for the previous shared global
+step-multiplier behavior. In that mode all variables move together along one
+projected row-band direction, and the line search uses the standard seven-point
+multiplier ladder:
+
+```text
+[10, 3, 1, 0.3, 0.1, 0.03, 0.01]
+```
+
+For global neighbor sweeps, the first local bracket is centered at
+`StepSweepStartMultiplier = 1`, so it initially tests `[3, 1, 0.3]`. The
+neighbor search now widens if the current bracket has no accepted candidate and
+also walks when the best accepted candidate is on a bracket edge. On
+intervening iterations it uses the last accepted multiplier directly. If that
+trusted single step fails, `RecoveryStepSweep = true` falls back to a full
+global bracket sweep for that iteration.
 
 To restore the old full-sweep behavior, set `StepSweepMode` to `"full"` and
 `StepSweepPeriod` to `1`:
@@ -163,9 +214,92 @@ To restore the old full-sweep behavior, set `StepSweepMode` to `"full"` and
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(30,'StepSweepMode','full','StepSweepPeriod',1);"
 ```
 
-With the updated weight-`0.007` diagnostic, the matching Python saved-state
-check reduced `J` from `1.0070000000` to `0.1807256857` before the next
-line-search bracket stopped.
+Recent from-begin smoke checks from `J ~= 1.007`:
+
+```text
+MATLAB direct default, 50 accepted steps:
+  J = 1.0070000000 -> 0.1222290604
+  scheduled direct-neighbor sweeps at iterations 20 and 40 used 13 and 12 trials
+
+MATLAB global neighbor, 30 accepted steps:
+  J = 1.0070000000 -> 0.1242666968
+  direct scalar ladders were empty, confirming the global path
+```
+
+#### MATLAB Overnight Runbook
+
+Use a unique `OutputPrefix` for each long run. For the default direct scalar
+mode, this starts a hidden MATLAB process, records its PID, writes a diary, and
+checkpoints every 50 accepted steps:
+
+```powershell
+$cwd = "C:\Users\Fan\Documents\Datafit"
+$prefix = "matlab_direct_scalar_from_begin_overnight"
+$batch = "cd('$cwd'); diary('${prefix}_diary.log'); optimize_rank_factors_pq_rowband(50000,'OutputPrefix','$prefix','CheckpointPeriod',50); diary off"
+$p = Start-Process -FilePath matlab -ArgumentList @("-batch", $batch) -WorkingDirectory $cwd -WindowStyle Hidden -RedirectStandardOutput "$cwd\${prefix}_command.log" -RedirectStandardError "$cwd\${prefix}_error.log" -PassThru
+Set-Content "$cwd\${prefix}_matlab_pid.txt" $p.Id
+```
+
+For the previous global scalar mode, add the option:
+
+```powershell
+'RowbandScalarUpdate','global_line_search'
+```
+
+For example, the MATLAB batch part becomes:
+
+```powershell
+$batch = "cd('$cwd'); diary('${prefix}_diary.log'); optimize_rank_factors_pq_rowband(50000,'RowbandScalarUpdate','global_line_search','OutputPrefix','$prefix','CheckpointPeriod',50); diary off"
+```
+
+The normal long-run files are:
+
+```text
+<prefix>_diary.log
+<prefix>_command.log
+<prefix>_error.log
+<prefix>_matlab_pid.txt
+<prefix>_checkpoint_state.mat
+<prefix>_checkpoint_history.csv
+<prefix>_checkpoint_results.json
+<prefix>_state.mat
+<prefix>_history.csv
+<prefix>_results.json
+```
+
+Monitor an overnight run with:
+
+```powershell
+$cwd = "C:\Users\Fan\Documents\Datafit"
+$prefix = "matlab_direct_scalar_from_begin_overnight"
+Get-Process -Id (Get-Content "$cwd\${prefix}_matlab_pid.txt")
+Get-Item "$cwd\${prefix}_diary.log","$cwd\${prefix}_command.log","$cwd\${prefix}_checkpoint_results.json","$cwd\${prefix}_checkpoint_history.csv","$cwd\${prefix}_checkpoint_state.mat"
+Get-Content "$cwd\${prefix}_diary.log" -Tail 30
+```
+
+When working in Codex, after the run is visibly writing checkpoints, ask Codex
+in plain language to keep quiet and check every half hour. A good instruction
+is: monitor this prefix, notify only if the run is weird or complete, and
+otherwise do not send repeated status messages.
+
+Treat the run as healthy when accepted steps and checkpoint timestamps are
+advancing, objectives are finite and nonincreasing, gauge errors stay below the
+configured tolerance, and logs contain no MATLAB errors, exceptions, `NaN`, or
+`Inf` objective/loss values. Treat it as weird if the process exits before a
+final `<prefix>_results.json` exists, checkpoint files stop updating while the
+MATLAB PID is still alive, objective values increase or become nonfinite, or
+the optimizer reports no accepted progress unexpectedly.
+
+When a final `<prefix>_results.json` exists and MATLAB has exited normally,
+summarize:
+
+```text
+objective_before / objective_after
+accepted_steps and stop_reason
+scalars_after, especially cl / cw and rat
+rowband_scalar_update, step_sweep_period, step_sweep_mode
+state_file, history_file, results_file
+```
 
 For long MATLAB runs, enable periodic checkpointing:
 
@@ -176,13 +310,21 @@ matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_ro
 This overwrites `matlab_long_rowband_checkpoint_state.mat`,
 `matlab_long_rowband_checkpoint_history.csv`, and
 `matlab_long_rowband_checkpoint_results.json` every 10 accepted steps. Resume
-from the latest checkpoint by passing it as `StatePath`; for neighbor-sweep
-runs, also pass the checkpoint JSON's `last_step_multiplier` as
-`InitialStepMultiplier` so the local step ladder continues from the same
-place:
+from the latest checkpoint by passing it as `StatePath`:
 
 ```powershell
-matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'StatePath','matlab_long_rowband_checkpoint_state.mat','InitialStepMultiplier',0.01,'OutputPrefix','matlab_long_rowband_resume');"
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'StatePath','matlab_long_rowband_checkpoint_state.mat','OutputPrefix','matlab_long_rowband_resume','CheckpointPeriod',10);"
+```
+
+For direct scalar mode, a resumed run starts without the previous direct tuple
+in memory, so the first resumed iteration performs a full direct sweep and then
+continues with trusted direct tuples. For global mode, you may also pass the
+checkpoint JSON's `last_step_multiplier` as `InitialStepMultiplier` to keep the
+local global bracket centered at the same place:
+
+```powershell
+$last = Get-Content "matlab_long_rowband_checkpoint_results.json" | ConvertFrom-Json
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(200,'RowbandScalarUpdate','global_line_search','StatePath','matlab_long_rowband_checkpoint_state.mat','InitialStepMultiplier',$($last.last_step_multiplier),'OutputPrefix','matlab_long_rowband_resume','CheckpointPeriod',10);"
 ```
 
 ## Run Python
@@ -252,7 +394,11 @@ for the rat-enabled all-variable row-band path:
   `from_begin_initial_state.npz`, and
   `all_variable_rowband_step_scaling_diagnostic_results.json`. In
   `rowband_all`, it uses the same measured row-band metric for the descent
-  direction and fixed-gauge projection.
+  direction and fixed-gauge projection. It supports the same
+  `--rowband-scalar-update direct_gradient_coordinate_sweep` and
+  `--rowband-scalar-update global_line_search` choices as MATLAB. The Python
+  path writes final JSON/CSV/NPZ artifacts but does not currently write
+  periodic checkpoints, so use MATLAB for unattended overnight runs.
 - `diagnose_pq_support_step_scaling.py` regenerates the all-variable row-band
   safe-step diagnostic, including `rat`.
 - `gradient_check_rank.py`, `check_retraction_refit.py`, and
@@ -275,12 +421,32 @@ python -m pip install --target ".python_deps\$cp" -r requirements.txt
 python optimize_rank_factors_pq_rowband.py
 ```
 
+The Python defaults match the MATLAB wrapper's optimizer policy: direct scalar
+coordinate sweeps, two initial full sweeps, `StepSweepPeriod = 20`, and
+adaptive neighbor scheduled sweeps. A global-line-search comparison is:
+
+```powershell
+python optimize_rank_factors_pq_rowband.py -n 30 --rowband-scalar-update global_line_search --output-prefix py_global_neighbor_check
+```
+
 By default, the optimizer writes:
 
 ```text
 rowband_all_rank_optimization_results.json
 rowband_all_rank_optimization_history.csv
 rowband_all_rank_optimization_state.npz
+```
+
+Recent Python smoke checks from `J ~= 1.007`:
+
+```text
+Python direct default, 20 accepted steps:
+  J = 1.0070000000 -> 0.1267376768
+  iteration 20 used adaptive direct-neighbor search with 13 trials
+
+Python global neighbor, 30 accepted steps:
+  J = 1.0070000000 -> 0.1242733102
+  direct scalar ladders were empty, confirming the global path
 ```
 
 ## Verified Outputs

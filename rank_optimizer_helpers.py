@@ -66,7 +66,7 @@ def candidate_summary_with_evaluation(
     candidate = add_scaled_variables(base_variables, direction, step)
     candidate = model.retract_variables(candidate)
     evaluation = model.evaluate(candidate)
-    objective = model.objective_from_residuals(evaluation.residuals)
+    objective = evaluation.objective
     gauge_errors = model.gauge_errors_from_fields(evaluation.fields)
     objective_change = objective - base_objective
     accepted = (
