@@ -300,7 +300,8 @@ class RankOptimizationModel:
                 out[key] = value.copy() if isinstance(value, np.ndarray) else float(value)
         return out
 
-    def _build_farfield_velocity_basis(self, data: dict[str, Any]) -> dict[str, np.ndarray]:
+    @staticmethod
+    def _build_farfield_velocity_basis(data: dict[str, Any]) -> dict[str, np.ndarray]:
         """Reconstruct the unit-rat far-field velocity contribution.
 
         The optimized ``u1``/``u2`` cores cover only the near-field pieces.  The
@@ -323,8 +324,10 @@ class RankOptimizationModel:
             polar_coeff,
             order=2,
         )
-        n1 = self.x1.size
-        n2 = self.x2.size
+        # The target crop belongs to the same saved dataset as the larger
+        # far-field grids, so this helper does not depend on model state.
+        n1 = np.asarray(data["x1"]).size
+        n2 = np.asarray(data["x2"]).size
         return {
             "u1": -psi1[(0, 1)][:n1, :n2],
             "u1x1": -psi1[(1, 1)][:n1, :n2],

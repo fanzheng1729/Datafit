@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Run row-band-scaled optimizer steps from a saved state.
+"""Run row-band-scaled optimizer steps from a saved state or MAT profile.
 
-This experiment starts from an existing optimizer state and runs the
+This experiment starts from an existing optimizer state or directly from the
+profile selected by ``--data`` and runs the
 all-variable row-band path, plus full-variable raw/vanilla controls.  The
 row-band path can either use the previous global line-search multiplier for
 all variables or direct scalar-gradient multiplier sweeps for cl/cw/rat with
@@ -1204,7 +1205,8 @@ def evaluate_neighbor_step_candidates(
 def run_optimizer(
     *,
     mode: str,
-    state_path: Path,
+    data_path: Path,
+    state_path: Path | None,
     rowband_diagnostic_path: Path | None,
     max_iterations: int,
     output_prefix: str,
@@ -1239,8 +1241,12 @@ def run_optimizer(
         raise ValueError("step_sweep_start_multiplier must be positive and finite")
     rowband_scalar_update = canonical_rowband_scalar_update(rowband_scalar_update)
 
-    model = RankOptimizationModel(DATA_PATH, constraint_weight=constraint_weight)
-    variables = model.complete_variables(load_state(state_path))
+    model = RankOptimizationModel(data_path, constraint_weight=constraint_weight)
+    variables = (
+        copy_variables(model.variables)
+        if state_path is None
+        else model.complete_variables(load_state(state_path))
+    )
     # Only row-band mode needs the diagnostic, but accepting an optional path
     # keeps the JSON output comparable across modes.
     rowband_diagnostic = None
@@ -1504,10 +1510,11 @@ def run_optimizer(
         save_state(paths["state"], variables)
 
     return {
-        "description": "Saved-state rank-factor optimizer comparison with all-variable row-band direction scaling.",
+        "description": "Rank-factor optimizer comparison with all-variable row-band direction scaling.",
         "mode": mode,
         "constraint_weight": constraint_weight,
-        "state_path": str(state_path),
+        "data_path": str(data_path),
+        "state_path": str(state_path) if state_path is not None else None,
         "rowband_diagnostic_path": str(rowband_diagnostic_path) if rowband_diagnostic_path is not None else None,
         "accepted_steps": accepted_count,
         "state_file": paths["state"].name if accepted_count > 0 else None,
@@ -1555,7 +1562,13 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
         choices=("vanilla", "raw_all", "rowband_all"),
         default="rowband_all",
     )
+    parser.add_argument("--data", type=Path, default=DATA_PATH)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument(
+        "--from-data",
+        action="store_true",
+        help="initialize rank factors and scalars directly from --data instead of loading --state",
+    )
     parser.add_argument("--rowband-diagnostic", type=Path, default=DEFAULT_ROWBAND_DIAGNOSTIC)
     parser.add_argument("-n", "--max-iterations", type=int, default=30)
     parser.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX)
@@ -1608,7 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
     np.set_printoptions(precision=10, suppress=False)
     output = run_optimizer(
         mode=args.mode,
-        state_path=args.state,
+        data_path=args.data,
+        state_path=None if args.from_data else args.state,
         rowband_diagnostic_path=args.rowband_diagnostic,
         max_iterations=args.max_iterations,
         output_prefix=args.output_prefix,

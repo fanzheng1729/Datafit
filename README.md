@@ -138,6 +138,13 @@ MATLAB path supports periodic checkpoints.
 matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband();"
 ```
 
+Use `DataPath` to initialize the optimizer from a different compatible MAT
+profile while keeping the same optimizer policy:
+
+```powershell
+matlab -batch "cd('C:\Users\Fan\Documents\Datafit'); optimize_rank_factors_pq_rowband(50,'DataPath','data_stab.mat','OutputPrefix','matlab_data_stab_50');"
+```
+
 Pass a leading integer to run a non-default number of iterations while keeping
 the other row-band defaults:
 
@@ -149,6 +156,7 @@ The wrapper defaults are:
 
 ```text
 Mode                         rowband_all
+DataPath                     data.mat
 StatePath                    ""  (start from the canonical data.mat fit)
 RowbandDiagnostic            all_variable_rowband_step_scaling_diagnostic_results.json
 MaxIterations                30

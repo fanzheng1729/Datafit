@@ -14,6 +14,7 @@ addpath("BS\")
 fprintf("Monitored explicit-S rank-factor gradient optimization (MATLAB)\n");
 fprintf("  max iterations:           %d\n", opts.maxIterations);
 fprintf("  output prefix:            %s\n", opts.outputPrefix);
+fprintf("  data path:                %s\n", opts.dataPath);
 fprintf("  mode:                     %s\n", opts.mode);
 if opts.mode == "rowband_all"
     fprintf("  rowband scalar update:    %s\n", opts.rowbandScalarUpdate);
@@ -29,7 +30,7 @@ end
 fprintf("  recovery step sweep:      %d\n", opts.recoveryStepSweep);
 fprintf("  checkpoint period:        %d\n", opts.checkpointPeriod);
 
-model = build_model(opts.constraintWeight);
+model = build_model(opts.constraintWeight, opts.dataPath);
 if strlength(opts.statePath) > 0
     fprintf("  starting state:           %s\n", opts.statePath);
     variables = load_optimizer_state(opts.statePath, model);
@@ -223,6 +224,7 @@ output = struct();
 output.description = "Saved-state rank-factor optimizer comparison with optional row-band direction scaling (MATLAB).";
 output.mode = opts.mode;
 output.constraint_weight = opts.constraintWeight;
+output.data_path = opts.dataPath;
 output.state_path = opts.statePath;
 output.rowband_diagnostic_path = opts.rowbandDiagnostic;
 output.accepted_steps = accepted_count;
@@ -309,6 +311,7 @@ opts = struct();
 opts.maxIterations = 20;
 opts.outputPrefix = "matlab_rank_optimization";
 opts.mode = "vanilla";
+opts.dataPath = "data.mat";
 opts.statePath = "";
 opts.rowbandDiagnostic = "";
 opts.constraintWeight = 10.0;
@@ -344,6 +347,8 @@ for k = 1:2:numel(varargin)
             opts.outputPrefix = string(value);
         case "mode"
             opts.mode = lower(string(value));
+        case {"datapath", "data"}
+            opts.dataPath = string(value);
         case {"statepath", "state"}
             opts.statePath = string(value);
         case "rowbanddiagnostic"
@@ -388,6 +393,9 @@ if ~any(opts.mode == valid_modes)
 end
 if opts.constraintWeight <= 0
     error("ConstraintWeight must be positive.");
+end
+if strlength(opts.dataPath) == 0 || ~isfile(opts.dataPath)
+    error("DataPath must name an existing MAT file: %s", opts.dataPath);
 end
 if opts.stepSweepInitialIterations < 0 || opts.stepSweepInitialIterations ~= floor(opts.stepSweepInitialIterations)
     error("StepSweepInitialIterations must be a nonnegative integer.");
@@ -873,15 +881,16 @@ end
 safeStep = double(safeStep);
 end
 
-function model = build_model(constraintWeight)
+function model = build_model(constraintWeight, dataPath)
 % Build every fixed quantity needed by the reduced rank-factor objective.
 %
 % The dependent variables are omega, zeta, u1, and u2. Each is represented by
 % P*S*Q' in a spline basis after applying the same damping/profile factors used
 % by runfit.m. The PDE residuals then operate on reconstructed physical fields.
 
-data = load("data.mat");
+data = load(char(dataPath));
 model = struct();
+model.dataPath = string(dataPath);
 model.x1 = double(data.x1(:));
 model.x2 = double(data.x2(:));
 model.x1Col = model.x1;
@@ -921,7 +930,7 @@ model.coreNames = string({model.cores.name});
 
 % The far-field stream-function piece is linear in the scalar coefficient rat.
 % Store the unit-rat basis once and let the optimizer move rat with cl/cw.
-model.farfieldVelocity = build_farfield_velocity_basis(data, model);
+model.farfieldVelocity = build_farfield_velocity_basis(data);
 rat = double(data.rec(7));
 cl = 4.0 * double(data.vx1(1, 1)) / double(data.wx1(1, 1));
 cw = double(data.Vel.u1dx1(1, 1)) + cl / 2.0;
@@ -967,7 +976,7 @@ for k = 1:numel(model.cores)
 end
 end
 
-function fixed = build_farfield_velocity_basis(data, model)
+function fixed = build_farfield_velocity_basis(data)
 % Reconstruct the semi-analytic far-field velocity correction from the stored
 % angular spline coefficients and polar derivative tables.
 
@@ -975,8 +984,10 @@ xycoe = XYcoef(double(data.gx1(:)), double(data.gx2(:)), double(data.alpha_b), d
 psi1 = Deri_Psi1(numel(data.gx1), numel(data.gx2), double(data.p_ag_coe), data.BS1d_large, 2, xycoe);
 psi1 = Cell_2double(psi1);
 
-n1 = numel(model.x1);
-n2 = numel(model.x2);
+% The target crop is part of the same saved dataset as the larger far-field
+% grids, so this helper does not need the partially constructed model.
+n1 = numel(data.x1);
+n2 = numel(data.x2);
 
 fixed = struct();
 fixed.u1 = -psi1(1:n1, 1:n2, 1, 2);
@@ -2114,6 +2125,7 @@ output.iteration = iteration;
 output.accepted_steps = numel(history);
 output.mode = opts.mode;
 output.constraint_weight = opts.constraintWeight;
+output.data_path = opts.dataPath;
 output.state_path = opts.statePath;
 output.rowband_diagnostic_path = opts.rowbandDiagnostic;
 output.state_file = paths.checkpointState;

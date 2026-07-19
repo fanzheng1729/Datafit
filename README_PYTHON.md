@@ -52,6 +52,13 @@ side.
 python optimize_rank_factors_pq_rowband.py
 ```
 
+To initialize directly from a compatible MAT profile instead of the default
+saved NPZ state, pass both `--data` and `--from-data`:
+
+```powershell
+python optimize_rank_factors_pq_rowband.py --data data_stab.mat --from-data -n 50 --output-prefix py_data_stab_50
+```
+
 Current defaults are:
 
 - `--mode rowband_all`
